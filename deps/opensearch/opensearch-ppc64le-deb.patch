@@ -1,0 +1,60 @@
+diff --git a/distribution/packages/build.gradle b/distribution/packages/build.gradle
+index d9410b7..adb8788 100644
+--- a/distribution/packages/build.gradle
++++ b/distribution/packages/build.gradle
+@@ -29,6 +29,7 @@
+ import org.opensearch.gradle.LoggedExec
+ import org.opensearch.gradle.MavenFilteringHack
+ import org.opensearch.gradle.OS
++import org.opensearch.gradle.VersionProperties
+ import org.opensearch.gradle.info.BuildParams
+ import org.redline_rpm.header.Flags
+ 
+@@ -115,9 +116,11 @@ Closure commonPackageConfig(String type, boolean jdk, String architecture) {
+     if (type == 'deb') {
+       if (architecture == 'x64') {
+         arch = 'amd64'
+-      } else {
+-        assert architecture == 'arm64' : architecture
++      } else if (architecture == 'arm64') {
+         arch = 'arm64'
++      } else {
++        assert architecture == 'ppc64le' : architecture
++        arch = 'ppc64el'
+       }
+     } else {
+       assert type == 'rpm' : type
+@@ -130,7 +133,8 @@ Closure commonPackageConfig(String type, boolean jdk, String architecture) {
+     }
+     // Follow opensearch's file naming convention
+     String jdkString = jdk ? "" : "-no-jdk"
+-    String prefix = "${architecture == 'arm64' ? 'arm64-' : ''}${jdk ? '' : 'no-jdk-'}${type}"
++    String archPrefix = (architecture == 'arm64') ? 'arm64-' : ((architecture == 'ppc64le') ? 'ppc64le-' : '')
++    String prefix = "${archPrefix}${jdk ? '' : 'no-jdk-'}${type}"
+     destinationDirectory = file("${prefix}/build/distributions")
+ 
+     // SystemPackagingTask overrides default archive task convention mappings, but doesn't provide a setter so we have to override the convention mapping itself
+@@ -368,6 +372,12 @@ Closure commonDebConfig(boolean jdk, String architecture) {
+     requires 'libc6'
+     requires 'adduser'
+ 
++    if (!jdk && architecture == 'ppc64le') {
++      String jdkMajor = VersionProperties.getBundledJdk('linux', 'ppc64le').tokenize('.+')[0]
++      requires "openjdk-${jdkMajor}-jre-headless"
++      link('/usr/share/opensearch/jdk', "/usr/lib/jvm/java-${jdkMajor}-openjdk-ppc64el")
++    }
++
+     into('/usr/share/lintian/overrides') {
+       from('src/deb/lintian/opensearch')
+       filePermissions {
+@@ -385,6 +395,10 @@ tasks.register('buildNoJdkArm64Deb', Deb) {
+   configure(commonDebConfig(false, 'arm64'))
+ }
+ 
++tasks.register('buildNoJdkPpc64leDeb', Deb) {
++  configure(commonDebConfig(false, 'ppc64le'))
++}
++
+ tasks.register('buildDeb', Deb) {
+   configure(commonDebConfig(true, 'x64'))
+ }

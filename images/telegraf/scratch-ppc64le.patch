@@ -1,0 +1,12 @@
+diff --git a/Dockerfile b/Dockerfile
+index a8ab1b7..697316a 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -12,6 +12,7 @@ RUN set -eux; \
+     case "$(apk --print-arch)" in \
+         x86_64)  ARCH='amd64';; \
+         aarch64) ARCH='arm64';; \
++        ppc64le) ARCH='ppc64le';; \
+         *) echo "Unsupported architecture: $(apk --print-arch)" >&2; exit 1;; \
+     esac; \
+     apk add --no-cache ca-certificates tzdata wget gnupg tar; \

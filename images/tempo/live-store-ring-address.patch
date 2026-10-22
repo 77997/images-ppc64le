@@ -1,0 +1,11 @@
+diff --git a/cmd/tempo/main.go b/cmd/tempo/main.go
+index 87a13532..4bf32f18 100644
+--- a/cmd/tempo/main.go
++++ b/cmd/tempo/main.go
+@@ -215,3 +215,5 @@ func loadConfig() (*app.Config, bool, bool, error) {
+ 		config.LiveStore.Ring.KVStore.Store = "inmemory"
+-		config.LiveStore.Ring.InstanceAddr = "127.0.0.1"
++		if config.LiveStore.Ring.InstanceAddr == "" {
++			config.LiveStore.Ring.InstanceAddr = "127.0.0.1"
++		}
+ 		config.LiveStore.PartitionRing.KVStore.Store = "inmemory"
