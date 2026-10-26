@@ -192,9 +192,10 @@ sudo /usr/sbin/rsct/bin/rmcctrl -p</code></pre>
 <h2>Static binaries</h2>
 
 <p>
-  <a href="tarballs/">/images-ppc64le/tarballs/</a> holds ppc64le builds of OpFlex, lego, cAdvisor,
-  mtail, the Prometheus exporters and Grafana's OpenSearch and Prometheus data source plugins, as
-  plain tarballs for the image builds to unpack.
+  <a href="tarballs/">/images-ppc64le/tarballs/</a> holds amd64 and ppc64le builds of OpFlex and of
+  smartctl_exporter, and ppc64le builds of lego, cAdvisor, mtail, the other Prometheus exporters and
+  Grafana's OpenSearch and Prometheus data source plugins, as plain tarballs for the image builds to
+  unpack.
 </p>
 
 <h2>Published versions</h2>
@@ -204,8 +205,11 @@ sudo /usr/sbin/rsct/bin/rmcctrl -p</code></pre>
   against, or PyPI's newest release where none applies; a Debian package at the newest release in the
   repository Kolla installs it from on amd64; a Grafana data source plugin at the newest version
   Grafana's plugin catalogue marks compatible with the Grafana release published here; a tarball at
-  the version Kolla's sources name; RSCT and dynamicrm at the newest version the ibmpackages/rsct PPA
-  publishes; OpFlex at the 77997/opflex release named when publishing, or its latest release.
+  the version Kolla's sources name; smartctl_exporter at its newest release, with
+  <a href="https://github.com/prometheus-community/smartctl_exporter/pull/397">prometheus-community/smartctl_exporter#397</a>
+  applied when that release collects, without describing them, exactly the metrics the pull request
+  describes; RSCT and dynamicrm at the newest version the ibmpackages/rsct PPA publishes; OpFlex at
+  the 77997/opflex release named when publishing, or its latest release.
 </p>
 
 <div class="scroll">

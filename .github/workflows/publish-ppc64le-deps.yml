@@ -38,6 +38,7 @@ jobs:
       rsct: ${{ steps.rsct.outputs.rsct }}
       drm: ${{ steps.rsct.outputs.drm }}
       opflex: ${{ steps.opflex.outputs.tag }}
+      smartctl_exporter: ${{ steps.smartctl.outputs.version }}
       wheels: ${{ steps.kolla.outputs.wheels }}
       debs: ${{ steps.kolla.outputs.debs }}
       tarballs: ${{ steps.kolla.outputs.tarballs }}
@@ -96,6 +97,12 @@ jobs:
           echo "Resolved OpFlex $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve the smartctl_exporter release
+        id: smartctl
+        uses: ./.github/actions/upstream-release
+        with:
+          repository: prometheus-community/smartctl_exporter
+
       - name: Resolve the wheels, debs, tarballs and Grafana plugins
         id: kolla
         env:
@@ -103,6 +110,7 @@ jobs:
           RSCT: ${{ steps.rsct.outputs.rsct }}
           DRM: ${{ steps.rsct.outputs.drm }}
           OPFLEX: ${{ steps.opflex.outputs.tag }}
+          SMARTCTL_EXPORTER: ${{ steps.smartctl.outputs.version }}
           WHEELS: >-
             grpcio cryptography bcrypt pynacl uwsgi python-qpid-proton py-radix numpy pyzmq magnum-cluster-api
             pyyaml markupsafe msgpack wrapt psutil pyrsistent netifaces tornado sysv-ipc ujson pillow psycopg2
@@ -266,6 +274,7 @@ jobs:
               *debs.items(),
               *((plugin["name"], plugin["version"]) for plugin in grafana_plugins),
               *((name, tarball["tag"]) for name, tarball in tarballs.items()),
+              ("smartctl-exporter", "v" + os.environ["SMARTCTL_EXPORTER"]),
               *wheels.items(),
               ("rsct", os.environ["RSCT"]),
               ("dynamicrm", os.environ["DRM"]),
@@ -1223,6 +1232,118 @@ jobs:
           path: libvirt-exporter-binary/
           retention-days: 5
 
+  build-smartctl-exporter:
+    needs: resolve
+    if: inputs.track == 'pages'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.resolve.outputs.smartctl_exporter }}
+    outputs:
+      fix: ${{ steps.source.outputs.fix }}
+      go: ${{ steps.source.outputs.go }}
+    steps:
+      - name: Checkout repository (for the descriptor patch)
+        uses: actions/checkout@v5
+
+      - name: Clone the release and apply PR 397 when it collects exactly the metrics PR 397 describes without describing them
+        id: source
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${{ github.workspace }}/smartctl-src:/src" \
+            -v "${{ github.workspace }}/deps/smartctl-exporter/register-scsi-descriptors.patch:/patch/register-scsi-descriptors.patch:ro" \
+            -e VERSION \
+            golang:trixie \
+            bash -c '
+              set -euo pipefail
+              git clone --depth 1 --branch "v$VERSION" https://github.com/prometheus-community/smartctl_exporter.git /src/smartctl_exporter
+              cd /src/smartctl_exporter
+              test "$(cat VERSION)" = "$VERSION" || { echo "::error title=smartctl_exporter $VERSION::Its VERSION file reads $(cat VERSION)"; exit 1; }
+              go env GOVERSION > /src/go
+              P=/patch/register-scsi-descriptors.patch
+              undescribed() {
+                LC_ALL=C comm -23 \
+                  <(for F in *.go; do case "$F" in (*_test.go) continue ;; esac; sed "/) Describe(ch/,/^}/d; /^[[:space:]]*metric[A-Z][A-Za-z0-9]*[[:space:]]*=/d" "$F"; done | grep -oE "metric[A-Z][A-Za-z0-9]+" | LC_ALL=C sort -u) \
+                  <(sed -n "/) Describe(ch/,/^}/p" main.go | grep -oE "metric[A-Z][A-Za-z0-9]+" | LC_ALL=C sort -u)
+              }
+              MISSING="$(undescribed)"
+              ADDS="$(sed -nE "s/^\+[[:space:]]+ch <- (metric[A-Za-z0-9]+)\$/\1/p" "$P" | LC_ALL=C sort -u)"
+              [ -n "$ADDS" ] || { echo "::error title=smartctl_exporter $VERSION::register-scsi-descriptors.patch describes no metric"; exit 1; }
+              if [ -z "$MISSING" ]; then
+                echo "::notice title=smartctl_exporter $VERSION::The release describes every metric it collects, so the build takes it as released"
+                echo released > /src/fix
+              elif [ "$MISSING" = "$ADDS" ]; then
+                git apply --include=main.go "$P" || { echo "::error title=smartctl_exporter $VERSION::The release collects exactly the metrics prometheus-community/smartctl_exporter#397 describes without describing them, but its main.go hunk does not apply"; exit 1; }
+                sed "s#main_test\.go#pr397_descriptors_test.go#g" "$P" | git apply --include=pr397_descriptors_test.go || { echo "::error title=smartctl_exporter $VERSION::The regression test of prometheus-community/smartctl_exporter#397 does not apply"; exit 1; }
+                MISSING="$(undescribed)"
+                [ -z "$MISSING" ] || { echo "::error title=smartctl_exporter $VERSION::With prometheus-community/smartctl_exporter#397 applied, it still collects $(echo $MISSING) without describing them"; exit 1; }
+                echo "::notice title=smartctl_exporter $VERSION::The release collects $(echo $ADDS) without describing them, so the build applies prometheus-community/smartctl_exporter#397 with its regression test"
+                echo applied > /src/fix
+              else
+                echo "::error title=smartctl_exporter $VERSION::The release collects $(echo $MISSING) without describing them, which is not exactly what prometheus-community/smartctl_exporter#397 describes"
+                exit 1
+              fi
+            '
+          echo "fix=$(cat smartctl-src/fix)" >> "$GITHUB_OUTPUT"
+          echo "go=$(cat smartctl-src/go)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache smartctl_exporter tarballs
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: smartctl-exporter
+          key: ${{ github.job }}-${{ env.VERSION }}-${{ steps.source.outputs.go }}-${{ fromJSON(needs.resolve.outputs.recipes)[github.job] }}-${{ hashFiles('deps/smartctl-exporter/*') }}
+
+      - name: Test the source and cross-compile it for amd64 and ppc64le
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p smartctl-exporter
+          docker run --rm \
+            -v "${{ github.workspace }}/smartctl-src/smartctl_exporter:/src" \
+            -v "${{ github.workspace }}/smartctl-exporter:/output" \
+            -w /src \
+            -e VERSION \
+            -e FIX="${{ steps.source.outputs.fix }}" \
+            -e GOTOOLCHAIN=local \
+            golang:trixie \
+            bash -c '
+              set -euxo pipefail
+              make test
+              case "$FIX" in
+                applied) MODIFIED=true ;;
+                released) MODIFIED=false ;;
+              esac
+              for ARCH in amd64 ppc64le; do
+                case "$ARCH" in
+                  amd64) LEVEL=GOAMD64=v1 ;;
+                  ppc64le) LEVEL=GOPPC64=power8 ;;
+                esac
+                env GOOS=linux "GOARCH=$ARCH" "$LEVEL" make build tarball
+                rm smartctl_exporter
+                NAME="smartctl_exporter-$VERSION.linux-$ARCH"
+                test "$(tar -tzf "$NAME.tar.gz" | LC_ALL=C sort)" = "$(printf "%s/\n%s/LICENSE\n%s/smartctl_exporter" "$NAME" "$NAME" "$NAME")"
+                mkdir "/tmp/$ARCH"
+                tar -xzf "$NAME.tar.gz" -C "/tmp/$ARCH"
+                test -x "/tmp/$ARCH/$NAME/smartctl_exporter"
+                cmp LICENSE "/tmp/$ARCH/$NAME/LICENSE"
+                go version -m "/tmp/$ARCH/$NAME/smartctl_exporter" | tee /tmp/buildinfo
+                for S in GOOS=linux "GOARCH=$ARCH" "$LEVEL" CGO_ENABLED=0 "vcs.modified=$MODIFIED"; do
+                  grep -qxF "$(printf "\tbuild\t%s" "$S")" /tmp/buildinfo || { echo "smartctl_exporter $ARCH lacks build setting $S"; exit 1; }
+                done
+                grep -qF -- "-X github.com/prometheus/common/version.Version=$VERSION " /tmp/buildinfo || { echo "smartctl_exporter $ARCH is not stamped with version $VERSION"; exit 1; }
+                mv "$NAME.tar.gz" "/output/smartctl_exporter-linux-$ARCH.tar.gz"
+              done
+            '
+          ls -la smartctl-exporter/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: smartctl-exporter
+          path: smartctl-exporter/
+          retention-days: 5
+
   download-opflex:
     needs: resolve
     if: inputs.track == 'pages'
@@ -1711,6 +1832,7 @@ jobs:
       - build-openstack-network-exporter
       - build-mtail
       - build-libvirt-exporter
+      - build-smartctl-exporter
       - download-opflex
       - build-fluent-package
       - build-opensearch
@@ -1861,6 +1983,7 @@ jobs:
           cp artifacts/openstack-network-exporter-binary/* $SITE/tarballs/
           cp artifacts/mtail-binary/* $SITE/tarballs/
           cp artifacts/libvirt-exporter-binary/* $SITE/tarballs/
+          cp artifacts/smartctl-exporter/* $SITE/tarballs/
           cp artifacts/grafana-plugins/* $SITE/tarballs/
 
           # Pages has no directory autoindex, so the landing page's tarballs/ link needs one.
@@ -1879,10 +2002,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSIONS: ${{ needs.resolve.outputs.versions }}
+          SMARTCTL_EXPORTER: ${{ needs.resolve.outputs.smartctl_exporter }}
+          SMARTCTL_EXPORTER_FIX: ${{ needs.build-smartctl-exporter.outputs.fix }}
+          SMARTCTL_EXPORTER_GO: ${{ needs.build-smartctl-exporter.outputs.go }}
         run: |
           set -euo pipefail
           TAG="ppc64le-deps/$(TZ=America/St_Johns date +%Y%m%d)-${GITHUB_RUN_NUMBER}"
-          BODY="$(jq -r 'map(join(" ")) | join(", ")' <<< "$VERSIONS")"
+          case "$SMARTCTL_EXPORTER_FIX" in
+            applied) FIX="smartctl-exporter v$SMARTCTL_EXPORTER is built with $SMARTCTL_EXPORTER_GO and prometheus-community/smartctl_exporter#397 applied." ;;
+            released) FIX="smartctl-exporter v$SMARTCTL_EXPORTER is built with $SMARTCTL_EXPORTER_GO as released, since it describes every metric it collects." ;;
+          esac
+          BODY="$(jq -r 'map(join(" ")) | join(", ")' <<< "$VERSIONS")"$'\n\n'"$FIX"
           mapfile -t ASSETS < <(find site/apt -name '*.deb'; find site/simple -name '*.whl'; find site/tarballs -type f ! -name index.html)
 
           gh release create "$TAG" \
