@@ -41,6 +41,7 @@ jobs:
       wheels: ${{ steps.kolla.outputs.wheels }}
       debs: ${{ steps.kolla.outputs.debs }}
       tarballs: ${{ steps.kolla.outputs.tarballs }}
+      grafana_plugins: ${{ steps.kolla.outputs.grafana_plugins }}
       recipes: ${{ steps.kolla.outputs.recipes }}
       versions: ${{ steps.kolla.outputs.versions }}
       source_builds: ${{ steps.kolla.outputs.source_builds }}
@@ -95,7 +96,7 @@ jobs:
           echo "Resolved OpFlex $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve the wheels, debs and tarballs from kolla
+      - name: Resolve the wheels, debs, tarballs and Grafana plugins
         id: kolla
         env:
           PYTHON_VERSION: ${{ steps.python.outputs.full }}
@@ -144,10 +145,14 @@ jobs:
               "mtail": "prometheus-mtail",
               "libvirt-exporter": "prometheus-libvirt-exporter",
           }
+          GRAFANA_PLUGINS = {
+              "grafana-opensearch-datasource": ("grafana-opensearch-datasource", "grafana/opensearch-datasource"),
+              "grafana-prometheus-datasource": ("prometheus", "grafana/grafana-prometheus-datasource"),
+          }
 
 
-          def fetch(url):
-              return subprocess.run(["curl", "-fsSL", "--max-time", "120", url], capture_output=True, check=True).stdout
+          def fetch(url, *headers):
+              return subprocess.run(["curl", "-fsSL", "--max-time", "120", *(arg for header in headers for arg in ("-H", header)), url], capture_output=True, check=True).stdout
 
 
           def literal(source, name):
@@ -217,6 +222,18 @@ jobs:
                       versions.append(fields["Version"])
               debs[name] = newest(versions)
 
+          grafana_version = debs["grafana"].replace("-", "+security-", 1)
+          grafana_plugins = []
+          for name, (plugin, repository) in GRAFANA_PLUGINS.items():
+              listing = json.loads(fetch(f"https://grafana.com/api/plugins/{plugin}/versions", f"grafana-version: {grafana_version}"))
+              compatible = {item["version"]: item["commit"] for item in listing["items"] if item["isCompatible"]}
+              if not compatible:
+                  sys.exit(f"grafana.com marks no {plugin} version compatible with Grafana {grafana_version}")
+              version = newest(list(compatible))
+              if not compatible[version]:
+                  sys.exit(f"grafana.com names no commit for {plugin} {version}")
+              grafana_plugins.append({"name": name, "id": plugin, "repository": repository, "version": version, "commit": compatible[version]})
+
           tarballs = {}
           for name, entry in TARBALLS.items():
               source = sources[entry]
@@ -247,6 +264,7 @@ jobs:
 
           versions = [
               *debs.items(),
+              *((plugin["name"], plugin["version"]) for plugin in grafana_plugins),
               *((name, tarball["tag"]) for name, tarball in tarballs.items()),
               *wheels.items(),
               ("rsct", os.environ["RSCT"]),
@@ -254,7 +272,7 @@ jobs:
               ("opflex", os.environ["OPFLEX"]),
           ]
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              for key, value in (("wheels", wheels), ("debs", debs), ("tarballs", tarballs), ("recipes", recipes), ("versions", versions), ("source_builds", source_builds)):
+              for key, value in (("wheels", wheels), ("debs", debs), ("tarballs", tarballs), ("grafana_plugins", grafana_plugins), ("recipes", recipes), ("versions", versions), ("source_builds", source_builds)):
                   print(f"{key}: {json.dumps(value, indent=1)}")
                   out.write(f"{key}={json.dumps(value, separators=(',', ':'))}\n")
           PY
@@ -1515,6 +1533,106 @@ jobs:
           path: grafana-deb/*.deb
           retention-days: 5
 
+  build-grafana-plugins:
+    needs: resolve
+    if: inputs.track == 'pages'
+    runs-on: ubuntu-latest
+    env:
+      PLUGINS: ${{ needs.resolve.outputs.grafana_plugins }}
+    steps:
+      - name: Checkout repository (for the mage target)
+        uses: actions/checkout@v5
+
+      - name: Name the plugin builds
+        id: versions
+        run: |
+          set -euo pipefail
+          echo "key=$(jq -r 'map("\(.id)-\(.version)-\(.commit)") | join("-")' <<< "$PLUGINS")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Grafana plugins
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: grafana-plugins
+          key: ${{ github.job }}-${{ steps.versions.outputs.key }}-${{ fromJSON(needs.resolve.outputs.recipes)[github.job] }}-${{ hashFiles('deps/grafana-plugins/*') }}
+
+      - name: Clone the plugins at their catalogue commits
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          jq -r '.[] | "\(.id) \(.repository) \(.version) \(.commit)"' <<< "$PLUGINS" | while read -r ID REPOSITORY VERSION COMMIT; do
+            docker run --rm \
+              -v "${{ github.workspace }}/plugin-src:/src" \
+              golang:trixie \
+              bash -c '
+                set -e
+                git clone --depth 1 --branch "v$1" "https://github.com/$2.git" "/src/$3"
+                test "$(git -C "/src/$3" rev-parse HEAD)" = "$4" || { echo "$2 v$1 is not the catalogue build $4"; exit 1; }
+              ' _ "$VERSION" "$REPOSITORY" "$ID" "$COMMIT"
+          done
+
+      - name: Build the frontends
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          for ID in $(jq -r '.[].id' <<< "$PLUGINS"); do
+            NODE="$(cat "plugin-src/$ID/.nvmrc")"
+            NODE="${NODE#v}"
+            NODE="${NODE%%.*}"
+            [ -n "$NODE" ] || { echo "$ID Node version resolution failed"; exit 1; }
+            docker run --rm \
+              -v "${{ github.workspace }}/plugin-src/$ID:/src" \
+              -w /src \
+              "node:$NODE-trixie" \
+              bash -c '
+                set -ex
+                PM="$(node -p "require(\"./package.json\").packageManager")"
+                case "$PM" in npm@*) ;; *) echo "packageManager is $PM, not npm"; exit 1 ;; esac
+                npm install -g "${PM%%+*}"
+                npm ci
+                npm run build
+              '
+          done
+
+      - name: Cross-compile the backends for ppc64le and package the plugins
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p grafana-plugins
+          docker run --rm \
+            -v "${{ github.workspace }}/plugin-src:/src" \
+            -v "${{ github.workspace }}/deps/grafana-plugins/ppc64le_mage.go:/mage/ppc64le_mage.go:ro" \
+            -v "${{ github.workspace }}/grafana-plugins:/output" \
+            -e IDS="$(jq -r 'map(.id) | join(" ")' <<< "$PLUGINS")" \
+            golang:trixie \
+            bash -c '
+              set -exo pipefail
+              mkdir -p /tmp/grafana-plugins
+              for ID in $IDS; do
+                cd "/src/$ID"
+                cp /mage/ppc64le_mage.go .
+                go run github.com/magefile/mage -v linuxppc64le
+                set -- dist/*_linux_ppc64le
+                test "$#" -eq 1
+                test -x "$1"
+                test ! -e dist/MANIFEST.txt
+                go version -m "$1" | tee /tmp/buildinfo
+                for S in GOOS=linux GOARCH=ppc64le GOPPC64=power8 CGO_ENABLED=0; do
+                  grep -qxF "$(printf "\tbuild\t%s" "$S")" /tmp/buildinfo || { echo "$ID backend lacks build setting $S"; exit 1; }
+                done
+                cp -a dist "/tmp/grafana-plugins/$ID"
+              done
+              tar -czf /output/grafana-plugins-ppc64le.tar.gz --owner=0 --group=0 --numeric-owner -C /tmp/grafana-plugins $IDS
+            '
+          ls -la grafana-plugins/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: grafana-plugins
+          path: grafana-plugins/
+          retention-days: 5
+
   build-rsct:
     needs: resolve
     if: inputs.track == 'pages'
@@ -1598,6 +1716,7 @@ jobs:
       - build-opensearch
       - build-opensearch-dashboards
       - build-grafana
+      - build-grafana-plugins
       - build-rsct
     runs-on: ubuntu-latest
     environment:
@@ -1742,6 +1861,7 @@ jobs:
           cp artifacts/openstack-network-exporter-binary/* $SITE/tarballs/
           cp artifacts/mtail-binary/* $SITE/tarballs/
           cp artifacts/libvirt-exporter-binary/* $SITE/tarballs/
+          cp artifacts/grafana-plugins/* $SITE/tarballs/
 
           # Pages has no directory autoindex, so the landing page's tarballs/ link needs one.
           echo '<!DOCTYPE html><html><body>' > $SITE/tarballs/index.html

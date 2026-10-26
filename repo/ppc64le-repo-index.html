@@ -193,7 +193,8 @@ sudo /usr/sbin/rsct/bin/rmcctrl -p</code></pre>
 
 <p>
   <a href="tarballs/">/images-ppc64le/tarballs/</a> holds ppc64le builds of OpFlex, lego, cAdvisor,
-  mtail and the Prometheus exporters, as plain tarballs for the image builds to unpack.
+  mtail, the Prometheus exporters and Grafana's OpenSearch and Prometheus data source plugins, as
+  plain tarballs for the image builds to unpack.
 </p>
 
 <h2>Published versions</h2>
@@ -201,9 +202,10 @@ sudo /usr/sbin/rsct/bin/rmcctrl -p</code></pre>
 <p>
   Each version is read when the site is published: a wheel at the upper constraint Kolla installs
   against, or PyPI's newest release where none applies; a Debian package at the newest release in the
-  repository Kolla installs it from on amd64; a tarball at the version Kolla's sources name; RSCT and
-  dynamicrm at the newest version the ibmpackages/rsct PPA publishes; OpFlex at the 77997/opflex
-  release named when publishing, or its latest release.
+  repository Kolla installs it from on amd64; a Grafana data source plugin at the newest version
+  Grafana's plugin catalogue marks compatible with the Grafana release published here; a tarball at
+  the version Kolla's sources name; RSCT and dynamicrm at the newest version the ibmpackages/rsct PPA
+  publishes; OpFlex at the 77997/opflex release named when publishing, or its latest release.
 </p>
 
 <div class="scroll">
