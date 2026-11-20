@@ -1,0 +1,43 @@
+From: Mahesh Salgaonkar <mahesh@linux.ibm.com>
+Date: Fri, 19 Sep 2025 22:49:45 +0530
+Subject: external/opal-prd: remove misleading errno error message
+Origin: upstream, https://github.com/open-power/skiboot/commit/5240ab5f83f16cee96ae92cd5f701dd65e6c003c
+Forwarded: not-needed
+Last-Update: 2026-11-20
+
+While handling memory error opal-prd displays misleading errno error
+messages even when handler was successfully able to soft/hard offline the
+requested memory page.
+
+opal-prd[49096]: MEM: Memory error: range 0000000eeb445700-0000000eeb445700, type: correctable
+opal-prd[49096]: MEM: Offlined 0000000eeb445700,0000000eeb455700, type correctable: No such file or directory
+
+In above example, an error message 'No such file or directory' was
+displayed even after successfully offlining memory. This is because
+printf in success case was using '%m' which prints errno based error
+message. The value in errno is significant only when the return value of
+the call indicated an error. The value of errno is never set to zero by
+any system call or library function.
+
+Hence, in success case do not use '%m' in printf to avoid misleading
+error message
+
+Signed-off-by: Mahesh Salgaonkar <mahesh@linux.ibm.com>
+Signed-off-by: Reza Arbab <arbab@linux.ibm.com>
+---
+ external/opal-prd/opal-prd.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/external/opal-prd/opal-prd.c b/external/opal-prd/opal-prd.c
+index da947c82728..d85e3e9bd07 100644
+--- a/external/opal-prd/opal-prd.c
++++ b/external/opal-prd/opal-prd.c
+@@ -721,7 +721,7 @@ static int memory_error_worker(const char *sysfsfile, const char *type,
+ 			ret = 1;
+ 		}
+ 	}
+-	pr_log(LOG_CRIT, "MEM: Offlined %016lx,%016lx, type %s: %m\n",
++	pr_log(LOG_CRIT, "MEM: Offlined %016lx,%016lx, type %s\n",
+ 			i_start_addr, addr, type);
+ 
+ 	close(memfd);

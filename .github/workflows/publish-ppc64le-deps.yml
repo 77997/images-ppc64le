@@ -1870,6 +1870,106 @@ jobs:
           path: rsct-debs/*.deb
           retention-days: 5
 
+  build-opal-prd:
+    needs: resolve
+    if: inputs.track == 'pages'
+    runs-on: ubuntu-latest
+    env:
+      # Debian ships skiboot 7.0+dfsg-1 in every suite, whose opal-prd tests fork()'s result the wrong way round in
+      # hservice_memory_error, so the daemon itself offlines the memory and exits, and systemd stops restarting it.
+      # No skiboot release carries the upstream fixes, so the build adds them to Debian's source as quilt patches.
+      # The version sorts above Debian's 7.0+dfsg-1+b2 and below any 7.0+dfsg-1.1 or 7.0+dfsg-2, so a Debian fix
+      # supersedes it.
+      SOURCE_VERSION: 7.0+dfsg-1
+      DSC_SHA256: c5597fb51d9c24a812a5ee3d472d588fea4c287c31d0b314ee653ce57de0a683
+      VERSION: 7.0+dfsg-1.1~as30265.1
+    steps:
+      - name: Checkout repository (for the patches and the changelog entry)
+        uses: actions/checkout@v5
+
+      - name: Cache opal-prd deb
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: opal-prd-deb
+          key: ${{ github.job }}-${{ env.VERSION }}-${{ fromJSON(needs.resolve.outputs.recipes)[github.job] }}-${{ hashFiles('deps/opal-prd/*') }}
+
+      - name: Set up QEMU
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: linux/ppc64le
+
+      - name: Build opal-prd for ppc64el from Debian's skiboot with the upstream fixes
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p opal-prd-deb
+          docker run --rm --platform linux/ppc64le \
+            -v "${{ github.workspace }}/opal-prd-deb:/output" \
+            -v "${{ github.workspace }}/deps/opal-prd:/deps:ro" \
+            -e SOURCE_VERSION -e DSC_SHA256 -e VERSION \
+            debian:trixie \
+            bash -c '
+              set -euxo pipefail
+              apt-get update
+              apt-get install -y --no-install-recommends build-essential ca-certificates curl dpkg-dev
+
+              # The pinned checksum fixes the .dsc, and dpkg-source checks both tarballs against it.
+              mkdir /build && cd /build
+              POOL=https://deb.debian.org/debian/pool/main/s/skiboot
+              for F in "skiboot_${SOURCE_VERSION}.dsc" "skiboot_${SOURCE_VERSION%-*}.orig.tar.xz" "skiboot_${SOURCE_VERSION}.debian.tar.xz"; do
+                curl -fsSLO --max-time 300 "$POOL/$F"
+              done
+              echo "$DSC_SHA256  skiboot_${SOURCE_VERSION}.dsc" | sha256sum -c -
+              dpkg-source --require-strong-checksums -x "skiboot_${SOURCE_VERSION}.dsc" skiboot
+              cd skiboot
+
+              # dpkg-source applies the patches with no fuzz, so a context that moved fails here.
+              for P in /deps/*.patch; do
+                cp "$P" debian/patches/
+                basename "$P" >> debian/patches/series
+              done
+              dpkg-source --before-build .
+              sed -n "/^int hservice_memory_error(/,/^}/p" external/opal-prd/opal-prd.c > /tmp/hservice_memory_error.c
+              grep -qF "if (pid == 0)" /tmp/hservice_memory_error.c \
+                || { echo "::error title=opal-prd::hservice_memory_error does not run the worker in the child, if (pid == 0)"; exit 1; }
+              if grep -qF "if (pid > 0)" /tmp/hservice_memory_error.c; then
+                echo "::error title=opal-prd::hservice_memory_error still runs the worker in the parent, if (pid > 0)"; exit 1
+              fi
+
+              cat /deps/changelog debian/changelog > /tmp/changelog
+              mv /tmp/changelog debian/changelog
+              test "$(dpkg-parsechangelog -S Version)" = "$VERSION" \
+                || { echo "::error title=opal-prd::The changelog entry names $(dpkg-parsechangelog -S Version), not $VERSION"; exit 1; }
+              for BOUND in "gt ${SOURCE_VERSION}+b2" "lt ${SOURCE_VERSION}.1" "lt ${SOURCE_VERSION%-*}-2"; do
+                dpkg --compare-versions "$VERSION" $BOUND \
+                  || { echo "::error title=opal-prd::$VERSION is not $BOUND"; exit 1; }
+              done
+
+              apt-get build-dep -y --no-install-recommends .
+              dpkg-buildpackage -us -uc -b
+              cd /build
+
+              # Only opal-prd is published; opal-utils stays Debian'\''s.
+              DEB="opal-prd_${VERSION}_ppc64el.deb"
+              dpkg-deb -c "$DEB" | grep -qE " \./usr/sbin/opal-prd$" \
+                || { echo "::error title=opal-prd::$DEB holds no usr/sbin/opal-prd"; exit 1; }
+              dpkg-deb -x "$DEB" /tmp/opal-prd
+              if grep -qaF "type %s: %m" /tmp/opal-prd/usr/sbin/opal-prd; then
+                echo "::error title=opal-prd::usr/sbin/opal-prd still prints errno after offlining memory"; exit 1
+              fi
+              cp "$DEB" /output/
+            '
+          ls -la opal-prd-deb/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: opal-prd-deb
+          path: opal-prd-deb/*.deb
+          retention-days: 5
+
   publish:
     needs:
       - resolve
@@ -1899,6 +1999,7 @@ jobs:
       - build-grafana
       - build-grafana-plugins
       - build-rsct
+      - build-opal-prd
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -1934,6 +2035,7 @@ jobs:
           cp artifacts/opensearch-dashboards-deb/*.deb $SITE/apt/
           cp artifacts/grafana-deb/*.deb $SITE/apt/
           cp artifacts/rsct-debs/*.deb $SITE/apt/
+          cp artifacts/opal-prd-deb/*.deb $SITE/apt/
           cd $SITE/apt
           dpkg-scanpackages . /dev/null > Packages
           gzip -k Packages

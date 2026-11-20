@@ -1,0 +1,62 @@
+From: Mahesh Salgaonkar <mahesh@linux.ibm.com>
+Date: Fri, 19 Sep 2025 22:49:44 +0530
+Subject: external/opal-prd: Fix opal-prd service shutdown on memory errors
+Origin: upstream, https://github.com/open-power/skiboot/commit/00416008b8ce018dd149182bf54a650eb95f9309
+Forwarded: not-needed
+Last-Update: 2026-11-20
+
+Whenever there is a memory error reported, opal-prd tries to spawn a
+child process using fork to delegate the memory offline work to child
+process. After handling memory error child process suppose to exit.
+However, instead of delegating the task to child process the main thread
+itself handles the memory error and exits. Thus causing opal-prd service
+to go into stop/restart loop and eventually hits the systemd restart
+limit leaving opal-prd service unavailable.
+
+opal-prd[49096]: MEM: Memory error: range 0000000eeb445700-0000000eeb445700, type: correctable
+opal-prd[49096]: MEM: Offlined 0000000eeb445700,0000000eeb455700, type correctable: No such file or directory
+systemd[1]: opal-prd.service: Service RestartSec=100ms expired, scheduling restart.
+systemd[1]: opal-prd.service: Scheduled restart job, restart counter is at 7.
+systemd[1]: opal-prd.service: Start request repeated too quickly.
+systemd[1]: opal-prd.service: Failed with result 'start-limit-hit'.
+systemd[1]: Failed to start OPAL PRD daemon
+
+The fork() function, on success, returns pid of child process (pid > 0)
+in the parent and 0 in the child. Instead of invoking memory worker
+when return value pid == 0, it invokes worker when pid > 0 which is
+parent process itself.
+
+    pid = fork();
+      if (pid > 0)
+           exit(memory_error_worker(sysfsfile, typestr, i_start_addr,
+							   i_endAddr));
+
+The above logic causes the parent thread to exit after handling memory
+error. Fix this by changing the if condition to (pid == 0).
+
+Fixes: 8cbd0de88d16 ("opal-prd: Have a worker process handle page offlining")
+Signed-off-by: Mahesh Salgaonkar <mahesh@linux.ibm.com>
+Signed-off-by: Reza Arbab <arbab@linux.ibm.com>
+---
+ external/opal-prd/opal-prd.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/external/opal-prd/opal-prd.c b/external/opal-prd/opal-prd.c
+index 1c610da4c0b6..da947c827282 100644
+--- a/external/opal-prd/opal-prd.c
++++ b/external/opal-prd/opal-prd.c
+@@ -755,9 +755,13 @@ int hservice_memory_error(uint64_t i_start_addr, uint64_t i_endAddr,
+ 	/*
+ 	 * HBRT expects the memory offlining process to happen in the background
+ 	 * after the notification is delivered.
++	 *
++	 * fork() return value:
++	 * On success, the PID of the child process is returned in the parent,
++	 * and 0 is returned in the child.
+ 	 */
+ 	pid = fork();
+-	if (pid > 0)
++	if (pid == 0)
+ 		exit(memory_error_worker(sysfsfile, typestr, i_start_addr, i_endAddr));
+ 
+ 	if (pid < 0) {

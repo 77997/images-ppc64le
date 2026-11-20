@@ -1,0 +1,13 @@
+skiboot (7.0+dfsg-1.1~as30265.1) trixie; urgency=medium
+
+  * Rebuild for the 77997/images-ppc64le apt repository with two upstream
+    opal-prd fixes that no skiboot release carries:
+    - 0006: open-power/skiboot 00416008b8ce018dd149182bf54a650eb95f9309,
+      "external/opal-prd: Fix opal-prd service shutdown on memory errors":
+      the forked worker, not the daemon, offlines the memory, so a memory
+      error no longer stops the daemon and hits the systemd start limit.
+    - 0007: open-power/skiboot 5240ab5f83f16cee96ae92cd5f701dd65e6c003c,
+      "external/opal-prd: remove misleading errno error message".
+
+ -- Bear <61359476+bearnl@users.noreply.github.com>  Fri, 20 Nov 2026 14:50:00 -0330
+
