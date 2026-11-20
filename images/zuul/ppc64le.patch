@@ -1,5 +1,5 @@
 diff --git a/Dockerfile b/Dockerfile
-index 5ab6719..e3a15f3 100644
+index 5ab6719..cb3e7a2 100644
 --- a/Dockerfile
 +++ b/Dockerfile
 @@ -17,11 +17,13 @@
@@ -29,15 +29,29 @@ index 5ab6719..e3a15f3 100644
  
  COPY web /tmp/src
  # Explicitly run the Javascript build
-@@ -68,6 +70,11 @@ ARG PBR_VERSION=
+@@ -68,7 +70,15 @@ ARG PBR_VERSION=
  
  COPY . /tmp/src
  COPY --from=js-builder /tmp/src/dist /tmp/src/zuul/web/static
+-RUN assemble
 +# ppc64le: compiled packages come from the images-ppc64le index at the versions it holds, and ppc64le
 +# wheels newer than manylinux_2_28 are refused, since their toolchain targets POWER9.
-+ENV PIP_EXTRA_INDEX_URL=https://77997.github.io/images-ppc64le/simple/ PIP_PREFER_BINARY=1 PIP_CONSTRAINT=/tmp/src/ppc64le/constraints.txt
++ENV PIP_EXTRA_INDEX_URL=https://77997.github.io/images-ppc64le/simple/ PIP_CONSTRAINT=/tmp/src/ppc64le/constraints.txt
 +RUN printf 'def manylinux_compatible(tag_major, tag_minor, tag_arch, **_):\n    if tag_arch == "ppc64le" and (tag_major, tag_minor) > (2, 28):\n        return False\n    return None\n' \
 +      > "$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')/_manylinux.py"
- RUN assemble
++# ppc64le: Zuul's own packages prefer a wheel over a newer sdist, which keeps them on the index's wheels; the Ansible
++# environments do not, since a package that now publishes only sdists then falls back to its last wheel, as
++# ibm-cos-sdk 1.2.0, which writes its own boto3, botocore and s3transfer over theirs.
++RUN PIP_PREFER_BINARY=1 assemble
  
  # The wheel install method doesn't run the setup hooks as the source based
+ # installations do so we have to call zuul-manage-ansible here. Remove
+@@ -83,6 +93,8 @@ RUN /output/install-from-bindep \
+   && cd /tmp/openshift-install/ \
+   && echo $OPENSHIFT_SHA /tmp/openshift-install/openshift-client.tgz | sha256sum --check \
+   && tar xvfz openshift-client.tgz -C /tmp/openshift-install
++# ppc64le: no environment may hold files of two distributions, which pip check alone does not see.
++RUN python3 /tmp/src/ppc64le/check-environments.py
+ 
+ FROM zuul-base AS zuul
+ ENV DEBIAN_FRONTEND=noninteractive

@@ -3,6 +3,7 @@
 // the Python of the images-ppc64le index, which publishes none for ppc64le.
 
 variable "VERSION" {}
+variable "REVISION" {}
 variable "PYTHON_VERSION" {}
 variable "REGISTRY" {}
 variable "SOURCE" {}
@@ -35,25 +36,25 @@ target "_zuul" {
 target "zuul-scheduler" {
   inherits = ["_zuul"]
   target   = "zuul-scheduler"
-  tags     = ["${REGISTRY}/zuul-scheduler:${VERSION}"]
+  tags     = ["${REGISTRY}/zuul-scheduler:${VERSION}-${REVISION}"]
 }
 
 target "zuul-executor" {
   inherits = ["_zuul"]
   target   = "zuul-executor"
-  tags     = ["${REGISTRY}/zuul-executor:${VERSION}"]
+  tags     = ["${REGISTRY}/zuul-executor:${VERSION}-${REVISION}"]
 }
 
 target "zuul-web" {
   inherits = ["_zuul"]
   target   = "zuul-web"
-  tags     = ["${REGISTRY}/zuul-web:${VERSION}"]
+  tags     = ["${REGISTRY}/zuul-web:${VERSION}-${REVISION}"]
 }
 
 target "zuul-launcher" {
   inherits = ["_zuul"]
   target   = "zuul-launcher"
-  tags     = ["${REGISTRY}/zuul-launcher:${VERSION}"]
+  tags     = ["${REGISTRY}/zuul-launcher:${VERSION}-${REVISION}"]
 }
 
 group "default" {

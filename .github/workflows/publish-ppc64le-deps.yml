@@ -19,7 +19,7 @@ on:
           - zookeeper
         default: pages
       version:
-        description: 'Image version, as 1.40.2, or a PostgreSQL major for trove-backup-postgresql (empty = highest release, or the newest major; gerrit builds the release its release.env names)'
+        description: 'Image version, as 1.40.2, or a PostgreSQL major for trove-backup-postgresql (empty = highest release, or the newest major; gerrit and zuul build the release their release.env names)'
         default: ''
       opflex_release:
         description: 'OpFlex release tag (empty = latest)'
@@ -2650,22 +2650,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Resolve the Zuul release and the index's Python
+      - name: Read the Zuul release and the image revision, and resolve the index's Python
         id: resolve
         env:
-          VERSION: ${{ inputs.version }}
+          REQUESTED: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [ -z "$VERSION" ]; then
-            VERSION="$(git ls-remote --tags --refs https://opendev.org/zuul/zuul.git \
-              | sed -nE 's#.*refs/tags/([0-9]+\.[0-9]+\.[0-9]+)$#\1#p' | sort -V | tail -1)"
+          . images/zuul/release.env
+          # The revision counts changes to the images of one release, so the track builds the release it names.
+          if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "$ZUUL_VERSION" ]; then
+            echo "release.env pins Zuul $ZUUL_VERSION, not $REQUESTED"; exit 1
           fi
-          [ -n "$VERSION" ] || { echo "Zuul version resolution failed"; exit 1; }
+          VERSION="$ZUUL_VERSION"
           PYTHON="$(docker run --rm debian:trixie bash -c 'apt-get update -qq && apt-cache show --no-all-versions python3' \
             | sed -nE 's/^Version: ([0-9]+\.[0-9]+)\..*/\1/p')"
           [ -n "$PYTHON" ] || { echo "Python version resolution failed"; exit 1; }
-          echo "Resolved Zuul $VERSION on Python $PYTHON"
-          { echo "version=$VERSION"; echo "python=$PYTHON"; } >> "$GITHUB_OUTPUT"
+          echo "Building Zuul $VERSION on Python $PYTHON, image revision $REVISION"
+          { echo "version=$VERSION"; echo "revision=$REVISION"; echo "python=$PYTHON"; } >> "$GITHUB_OUTPUT"
 
       - name: Clone and patch Zuul, OpenDev's Python base images and the index's constraints
         env:
@@ -2687,6 +2688,7 @@ jobs:
             echo "OPENSHIFT_SHA=$SHA"
           } >> "$GITHUB_ENV"
           mkdir -p zuul/ppc64le
+          cp images/zuul/check-environments.py zuul/ppc64le/
           python3 - "$PYTHON" > zuul/ppc64le/constraints.txt <<'PY'
           import re
           import sys
@@ -2707,10 +2709,13 @@ jobs:
               return versions.pop()
 
           grpcio = held("grpcio")
-          # The compiled packages Zuul shares with the index, at the versions it holds; grpcio-status releases with grpcio.
+          # The compiled packages Zuul and its Ansible environments share with the index, at the versions it holds;
+          # grpcio-status releases with grpcio.
           print(f"grpcio=={grpcio}")
           print(f"grpcio-status=={grpcio}")
           print(f"confluent-kafka=={held('confluent-kafka')}")
+          print(f"google-re2=={held('google-re2')}")
+          print(f"google-crc32c=={held('google-crc32c')}")
           PY
           cat zuul/ppc64le/constraints.txt
 
@@ -2732,6 +2737,7 @@ jobs:
       - name: Build and push Zuul's scheduler, executor, web and launcher
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
+          REVISION: ${{ steps.resolve.outputs.revision }}
           PYTHON_VERSION: ${{ steps.resolve.outputs.python }}
           REGISTRY: ghcr.io/${{ github.repository }}
           SOURCE: https://github.com/${{ github.repository }}
