@@ -1912,6 +1912,10 @@ jobs:
         with:
           path: artifacts
 
+      - name: Install apt-ftparchive
+        # The Ubuntu 26.04 runner image no longer carries apt-utils.
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends apt-utils
+
       - name: Build Pages directory
         env:
           WHEELS: ${{ needs.resolve.outputs.wheels }}
