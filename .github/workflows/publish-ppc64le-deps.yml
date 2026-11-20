@@ -16,7 +16,7 @@ on:
           - trove-guest
         default: pages
       version:
-        description: 'Image version, as 1.40.2, or a PostgreSQL major for trove-backup-postgresql (empty = highest release, or every major)'
+        description: 'Image version, as 1.40.2, or a PostgreSQL major for trove-backup-postgresql (empty = highest release, or the newest major)'
         default: ''
       opflex_release:
         description: 'OpFlex release tag (empty = latest)'
@@ -2281,17 +2281,30 @@ jobs:
               return set(re.findall(r"^Package: postgresql-client-(\d+)$", packages, re.M))
 
 
-          # The majors the official postgres image maintains, for which the PostgreSQL project
-          # publishes a trixie client on both architectures
+          def published(major):
+              # Whether Docker Hub's postgres:<major>, the image Trove's guests run, holds both architectures
+              token = json.loads(fetch("https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/postgres:pull"))["token"]
+              request = urllib.request.Request(f"https://registry-1.docker.io/v2/library/postgres/manifests/{major}", headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json",
+              })
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  index = json.load(response)
+              return {"amd64", "ppc64le"} <= {m["platform"]["architecture"] for m in index.get("manifests", [])}
+
+
+          # The newest major the official postgres image maintains and has published for both
+          # architectures, for which the PostgreSQL project publishes a trixie client on both,
+          # or the one the version input names; the images of older majors stay as published
           maintained = {major for major in json.loads(fetch("https://raw.githubusercontent.com/docker-library/postgres/master/versions.json")) if major.isdigit()}
-          majors = sorted(maintained & clients("amd64") & clients("ppc64el"), key=int)
+          available = sorted(maintained & clients("amd64") & clients("ppc64el"), key=int)
+          usable = [major for major in available if published(major)]
+          if not usable:
+              sys.exit(f"Docker Hub's postgres publishes none of {available} for both architectures")
           version = os.environ["VERSION"]
-          if version:
-              if version not in majors:
-                  sys.exit(f"PostgreSQL {version} is not one of {majors}")
-              majors = [version]
-          if not majors:
-              sys.exit("no PostgreSQL major to build")
+          if version and version not in usable:
+              sys.exit(f"PostgreSQL {version} is not one of {usable}")
+          majors = [version or usable[-1]]
           print(f"Resolved PostgreSQL majors {majors}")
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"majors={json.dumps(majors)}\n")
