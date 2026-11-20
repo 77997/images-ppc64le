@@ -14,6 +14,9 @@ on:
           - tempo
           - trove-backup-postgresql
           - trove-guest
+          - zuul
+          - gerrit
+          - zookeeper
         default: pages
       version:
         description: 'Image version, as 1.40.2, or a PostgreSQL major for trove-backup-postgresql (empty = highest release, or the newest major)'
@@ -117,6 +120,7 @@ jobs:
             grpcio cryptography bcrypt pynacl uwsgi python-qpid-proton py-radix numpy pyzmq magnum-cluster-api
             pyyaml markupsafe msgpack wrapt psutil pyrsistent netifaces tornado sysv-ipc ujson pillow psycopg2
             libsass zstd lz4 ruamel-yaml-clib yappi python-ldap scrypt rcssmin rjsmin immutables zeroconf gssapi krb5
+            google-re2 google-crc32c confluent-kafka
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/resolve"
@@ -542,6 +546,58 @@ jobs:
                 esac
               done
             '
+          ls -la wheel-output/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.pip_name }}-wheel
+          path: wheel-output/*.whl
+          retention-days: 5
+
+  build-zuul-wheels:
+    needs: resolve
+    if: inputs.track == 'pages'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pip_name: google-re2
+            image: docker.io/library/debian:trixie
+          - pip_name: google-crc32c
+            image: quay.io/pypa/manylinux_2_28_ppc64le
+          - pip_name: confluent-kafka
+            image: quay.io/pypa/manylinux_2_28_ppc64le
+    env:
+      VERSION: ${{ fromJSON(needs.resolve.outputs.wheels)[matrix.pip_name] }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Cache ${{ matrix.pip_name }} wheel
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: wheel-output
+          key: ${{ github.job }}-${{ matrix.pip_name }}-${{ env.VERSION }}-${{ needs.resolve.outputs.abi }}-${{ hashFiles(format('deps/zuul-wheels/{0}.sh', matrix.pip_name)) }}-${{ fromJSON(needs.resolve.outputs.recipes)[github.job] }}
+
+      - name: Set up QEMU
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: linux/ppc64le
+
+      - name: Build ${{ matrix.pip_name }} wheel for ppc64le
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p wheel-output
+          docker run --rm --platform linux/ppc64le \
+            -e VERSION -e ABI=${{ needs.resolve.outputs.abi }} \
+            -v "${{ github.workspace }}/wheel-output:/output" \
+            -v "${{ github.workspace }}/deps/zuul-wheels:/recipe:ro" \
+            ${{ matrix.image }} \
+            bash /recipe/${{ matrix.pip_name }}.sh
           ls -la wheel-output/
 
       - name: Upload artifact
@@ -1821,6 +1877,7 @@ jobs:
       - build-grpcio
       - build-crypto-wheels
       - build-manylinux-wheel
+      - build-zuul-wheels
       - build-pynacl-wheel
       - build-uwsgi-proton-wheels
       - build-py-radix-wheel
@@ -2476,3 +2533,200 @@ jobs:
             --title "Trove guest disks $(TZ=America/St_Johns date '+%b %-d, %Y (%Z)')" \
             --notes "$BODY" \
             disks/*.qcow2 disks/*.qcow2.sha256
+
+  build-zuul:
+    if: inputs.track == 'zuul'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Resolve the Zuul release and the index's Python
+        id: resolve
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VERSION" ]; then
+            VERSION="$(git ls-remote --tags --refs https://opendev.org/zuul/zuul.git \
+              | sed -nE 's#.*refs/tags/([0-9]+\.[0-9]+\.[0-9]+)$#\1#p' | sort -V | tail -1)"
+          fi
+          [ -n "$VERSION" ] || { echo "Zuul version resolution failed"; exit 1; }
+          PYTHON="$(docker run --rm debian:trixie bash -c 'apt-get update -qq && apt-cache show --no-all-versions python3' \
+            | sed -nE 's/^Version: ([0-9]+\.[0-9]+)\..*/\1/p')"
+          [ -n "$PYTHON" ] || { echo "Python version resolution failed"; exit 1; }
+          echo "Resolved Zuul $VERSION on Python $PYTHON"
+          { echo "version=$VERSION"; echo "python=$PYTHON"; } >> "$GITHUB_OUTPUT"
+
+      - name: Clone and patch Zuul, OpenDev's Python base images and the index's constraints
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          PYTHON: ${{ steps.resolve.outputs.python }}
+        run: |
+          set -euo pipefail
+          git -c advice.detachedHead=false clone --depth 1 --branch "$VERSION" https://opendev.org/zuul/zuul.git zuul
+          git -C zuul apply "$GITHUB_WORKSPACE/images/zuul/ppc64le.patch"
+          git clone --depth 1 --filter=blob:none --sparse https://opendev.org/opendev/system-config.git system-config
+          git -C system-config sparse-checkout set docker/python-base docker/python-builder
+          OCP="$(sed -nE 's#^ARG OPENSHIFT_URL=.*/clients/ocp/([^/]+)/.*#\1#p' zuul/Dockerfile)"
+          [ -n "$OCP" ] || { echo "Zuul's Dockerfile names no OpenShift client version"; exit 1; }
+          SHA="$(curl -fsSL "https://mirror.openshift.com/pub/openshift-v4/ppc64le/clients/ocp/$OCP/sha256sum.txt" \
+            | awk -v file="openshift-client-linux-$OCP.tar.gz" '$2 == file {print $1}')"
+          [ ${#SHA} -eq 64 ] || { echo "No checksum for the ppc64le OpenShift client $OCP"; exit 1; }
+          {
+            echo "OPENSHIFT_URL=https://mirror.openshift.com/pub/openshift-v4/ppc64le/clients/ocp/$OCP/openshift-client-linux-$OCP.tar.gz"
+            echo "OPENSHIFT_SHA=$SHA"
+          } >> "$GITHUB_ENV"
+          mkdir -p zuul/ppc64le
+          python3 - "$PYTHON" > zuul/ppc64le/constraints.txt <<'PY'
+          import re
+          import sys
+          import urllib.request
+
+          abi = "cp" + sys.argv[1].replace(".", "")
+          index = "https://77997.github.io/images-ppc64le/simple/"
+
+          def held(project):
+              page = urllib.request.urlopen(index + project + "/", timeout=60).read().decode()
+              versions = set()
+              for name in re.findall(r">([^<]+\.whl)<", page):
+                  parts = name[:-4].split("-")
+                  if parts[2] == abi or parts[3] == "abi3":
+                      versions.add(parts[1])
+              if len(versions) != 1:
+                  sys.exit(f"The index holds {sorted(versions) or 'no'} {project} wheels for {abi}")
+              return versions.pop()
+
+          grpcio = held("grpcio")
+          # The compiled packages Zuul shares with the index, at the versions it holds; grpcio-status releases with grpcio.
+          print(f"grpcio=={grpcio}")
+          print(f"grpcio-status=={grpcio}")
+          print(f"confluent-kafka=={held('confluent-kafka')}")
+          PY
+          cat zuul/ppc64le/constraints.txt
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: linux/ppc64le
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Zuul's scheduler, executor, web and launcher
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          PYTHON_VERSION: ${{ steps.resolve.outputs.python }}
+          REGISTRY: ghcr.io/${{ github.repository }}
+          SOURCE: https://github.com/${{ github.repository }}
+        run: docker buildx bake -f images/zuul/docker-bake.hcl --push
+
+  build-gerrit:
+    if: inputs.track == 'gerrit'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Resolve the Gerrit release and its published checksum
+        id: resolve
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VERSION" ]; then
+            VERSION="$(git ls-remote --tags --refs https://gerrit.googlesource.com/gerrit \
+              | sed -nE 's#.*refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$#\1#p' | sort -V | tail -1)"
+          fi
+          [ -n "$VERSION" ] || { echo "Gerrit version resolution failed"; exit 1; }
+          MD5="$(curl -fsSI "https://gerrit-releases.storage.googleapis.com/gerrit-$VERSION.war" \
+            | sed -nE 's/^x-goog-hash: md5=([A-Za-z0-9+/=]+).*/\1/Ip' | base64 -d | od -An -tx1 | tr -d ' \n')"
+          [ ${#MD5} -eq 32 ] || { echo "No MD5 published for gerrit-$VERSION.war"; exit 1; }
+          echo "Resolved Gerrit $VERSION"
+          { echo "version=$VERSION"; echo "md5=$MD5"; } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: linux/ppc64le
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Gerrit
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          MD5: ${{ steps.resolve.outputs.md5 }}
+          IMAGE: ghcr.io/${{ github.repository }}/gerrit
+          SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          docker buildx build --platform linux/amd64,linux/ppc64le \
+            --build-arg GERRIT_VERSION="$VERSION" --build-arg GERRIT_MD5="$MD5" \
+            --label "org.opencontainers.image.source=$SOURCE" \
+            --tag "$IMAGE:$VERSION" \
+            --push images/gerrit
+
+  build-zookeeper:
+    if: inputs.track == 'zookeeper'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Resolve Debian's ZooKeeper
+        id: resolve
+        run: |
+          set -euo pipefail
+          VERSION="$(docker run --rm debian:trixie bash -c 'apt-get update -qq && apt-cache show --no-all-versions zookeeper' \
+            | sed -nE 's/^Version: (.+)/\1/p' | tr '+~' '--')"
+          [ -n "$VERSION" ] || { echo "ZooKeeper version resolution failed"; exit 1; }
+          echo "Resolved ZooKeeper $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: linux/ppc64le
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ZooKeeper
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}/zookeeper:${{ steps.resolve.outputs.version }}
+          SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          docker buildx build --platform linux/amd64,linux/ppc64le \
+            --label "org.opencontainers.image.source=$SOURCE" \
+            --tag "$IMAGE" \
+            --push images/zookeeper

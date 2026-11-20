@@ -1,0 +1,43 @@
+diff --git a/Dockerfile b/Dockerfile
+index 5ab6719..e3a15f3 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -17,11 +17,13 @@
+ # Set this to "-debug" to build a debug image (includes gdb, debug
+ # symbols, and is quite a bit larger).
+ ARG IMAGE_FLAVOR=
++# ppc64le: the Python of the images-ppc64le index
++ARG PYTHON_VERSION
+ 
+ # Base images, defined as separate stages to allow for mirror selection or
+ # downstream customization via named contexts when built with docker buildx.
+ 
+-FROM quay.io/opendevorg/python-base:3.14-trixie${IMAGE_FLAVOR} AS zuul-base
++FROM quay.io/opendevorg/python-base:${PYTHON_VERSION}-trixie${IMAGE_FLAVOR} AS zuul-base
+ 
+ # This is a mirror of:
+ # FROM docker.io/library/node:22-trixie AS node-base
+@@ -31,9 +33,9 @@ FROM quay.io/opendevmirror/node:22-trixie AS node-base
+ # FROM golang:1.25-trixie AS go-base
+ FROM quay.io/opendevmirror/golang:1.25-trixie AS go-base
+ 
+-FROM quay.io/opendevorg/python-builder:3.14-trixie AS builder-base
++FROM quay.io/opendevorg/python-builder:${PYTHON_VERSION}-trixie AS builder-base
+ 
+-FROM node-base AS js-builder
++FROM --platform=$BUILDPLATFORM quay.io/opendevmirror/node:22-trixie AS js-builder
+ 
+ COPY web /tmp/src
+ # Explicitly run the Javascript build
+@@ -68,6 +70,11 @@ ARG PBR_VERSION=
+ 
+ COPY . /tmp/src
+ COPY --from=js-builder /tmp/src/dist /tmp/src/zuul/web/static
++# ppc64le: compiled packages come from the images-ppc64le index at the versions it holds, and ppc64le
++# wheels newer than manylinux_2_28 are refused, since their toolchain targets POWER9.
++ENV PIP_EXTRA_INDEX_URL=https://77997.github.io/images-ppc64le/simple/ PIP_PREFER_BINARY=1 PIP_CONSTRAINT=/tmp/src/ppc64le/constraints.txt
++RUN printf 'def manylinux_compatible(tag_major, tag_minor, tag_arch, **_):\n    if tag_arch == "ppc64le" and (tag_major, tag_minor) > (2, 28):\n        return False\n    return None\n' \
++      > "$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')/_manylinux.py"
+ RUN assemble
+ 
+ # The wheel install method doesn't run the setup hooks as the source based
