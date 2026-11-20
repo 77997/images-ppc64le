@@ -19,7 +19,7 @@ on:
           - zookeeper
         default: pages
       version:
-        description: 'Image version, as 1.40.2, or a PostgreSQL major for trove-backup-postgresql (empty = highest release, or the newest major)'
+        description: 'Image version, as 1.40.2, or a PostgreSQL major for trove-backup-postgresql (empty = highest release, or the newest major; gerrit builds the release its release.env names)'
         default: ''
       opflex_release:
         description: 'OpFlex release tag (empty = latest)'
@@ -2645,22 +2645,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Resolve the Gerrit release and its published checksum
+      - name: Read the Gerrit release and the image revision, and the release's published checksum
         id: resolve
         env:
-          VERSION: ${{ inputs.version }}
+          REQUESTED: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [ -z "$VERSION" ]; then
-            VERSION="$(git ls-remote --tags --refs https://gerrit.googlesource.com/gerrit \
-              | sed -nE 's#.*refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$#\1#p' | sort -V | tail -1)"
+          . images/gerrit/release.env
+          # The OAuth plugin is pinned for one Gerrit release, so the track builds that release and no other.
+          if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "$GERRIT_VERSION" ]; then
+            echo "release.env pins Gerrit $GERRIT_VERSION, not $REQUESTED"; exit 1
           fi
-          [ -n "$VERSION" ] || { echo "Gerrit version resolution failed"; exit 1; }
-          MD5="$(curl -fsSI "https://gerrit-releases.storage.googleapis.com/gerrit-$VERSION.war" \
+          MD5="$(curl -fsSI "https://gerrit-releases.storage.googleapis.com/gerrit-$GERRIT_VERSION.war" \
             | sed -nE 's/^x-goog-hash: md5=([A-Za-z0-9+/=]+).*/\1/Ip' | base64 -d | od -An -tx1 | tr -d ' \n')"
-          [ ${#MD5} -eq 32 ] || { echo "No MD5 published for gerrit-$VERSION.war"; exit 1; }
-          echo "Resolved Gerrit $VERSION"
-          { echo "version=$VERSION"; echo "md5=$MD5"; } >> "$GITHUB_OUTPUT"
+          [ ${#MD5} -eq 32 ] || { echo "No MD5 published for gerrit-$GERRIT_VERSION.war"; exit 1; }
+          echo "Building Gerrit $GERRIT_VERSION, image revision $REVISION"
+          { echo "version=$GERRIT_VERSION"; echo "revision=$REVISION"; echo "md5=$MD5"; } >> "$GITHUB_OUTPUT"
+
+      - name: Build the OAuth plugin's Entra ID provider
+        timeout-minutes: 60
+        run: images/gerrit/build-oauth-plugin.sh images/gerrit/oauth.jar
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -2681,13 +2685,13 @@ jobs:
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
           MD5: ${{ steps.resolve.outputs.md5 }}
-          IMAGE: ghcr.io/${{ github.repository }}/gerrit
+          IMAGE: ghcr.io/${{ github.repository }}/gerrit:${{ steps.resolve.outputs.version }}-${{ steps.resolve.outputs.revision }}
           SOURCE: https://github.com/${{ github.repository }}
         run: |
           docker buildx build --platform linux/amd64,linux/ppc64le \
             --build-arg GERRIT_VERSION="$VERSION" --build-arg GERRIT_MD5="$MD5" \
             --label "org.opencontainers.image.source=$SOURCE" \
-            --tag "$IMAGE:$VERSION" \
+            --tag "$IMAGE" \
             --push images/gerrit
 
   build-zookeeper:
