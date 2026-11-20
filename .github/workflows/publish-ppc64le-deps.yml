@@ -12,9 +12,11 @@ on:
           - ipmi-exporter
           - idrac-exporter
           - tempo
+          - trove-backup-postgresql
+          - trove-guest
         default: pages
       version:
-        description: 'Image version, as 1.40.2 (empty = highest release)'
+        description: 'Image version, as 1.40.2, or a PostgreSQL major for trove-backup-postgresql (empty = highest release, or every major)'
         default: ''
       opflex_release:
         description: 'OpFlex release tag (empty = latest)'
@@ -2222,3 +2224,242 @@ jobs:
           docker build --provenance false --platform linux/amd64 -f cmd/tempo/Dockerfile \
             --label "org.opencontainers.image.source=$SOURCE" -t "$IMAGE" .
           docker push "$IMAGE"
+
+  resolve-trove-backup-postgresql:
+    if: inputs.track == 'trove-backup-postgresql'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      majors: ${{ steps.majors.outputs.majors }}
+      trove_url: ${{ steps.trove.outputs.url }}
+      trove_sha256: ${{ steps.trove.outputs.sha256 }}
+      requirements_url: ${{ steps.requirements.outputs.url }}
+      requirements_sha256: ${{ steps.requirements.outputs.sha256 }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Resolve Trove as kolla installs it
+        id: trove
+        uses: ./.github/actions/kolla-source
+        with:
+          kolla: 77997/kolla
+          kolla-branch: stable/2026.1
+          source: trove-base
+
+      - name: Resolve the requirements kolla installs with
+        id: requirements
+        uses: ./.github/actions/kolla-source
+        with:
+          kolla: 77997/kolla
+          kolla-branch: stable/2026.1
+          source: openstack-base
+
+      - name: Resolve the PostgreSQL majors
+        id: majors
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import gzip
+          import json
+          import os
+          import re
+          import sys
+          import urllib.request
+
+
+          def fetch(url):
+              with urllib.request.urlopen(url, timeout=120) as response:
+                  return response.read()
+
+
+          def clients(arch):
+              packages = gzip.decompress(fetch(f"https://apt.postgresql.org/pub/repos/apt/dists/trixie-pgdg/main/binary-{arch}/Packages.gz")).decode()
+              return set(re.findall(r"^Package: postgresql-client-(\d+)$", packages, re.M))
+
+
+          # The majors the official postgres image maintains, for which the PostgreSQL project
+          # publishes a trixie client on both architectures
+          maintained = {major for major in json.loads(fetch("https://raw.githubusercontent.com/docker-library/postgres/master/versions.json")) if major.isdigit()}
+          majors = sorted(maintained & clients("amd64") & clients("ppc64el"), key=int)
+          version = os.environ["VERSION"]
+          if version:
+              if version not in majors:
+                  sys.exit(f"PostgreSQL {version} is not one of {majors}")
+              majors = [version]
+          if not majors:
+              sys.exit("no PostgreSQL major to build")
+          print(f"Resolved PostgreSQL majors {majors}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"majors={json.dumps(majors)}\n")
+          PY
+
+  build-trove-backup-postgresql:
+    needs: resolve-trove-backup-postgresql
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        major: ${{ fromJson(needs.resolve-trove-backup-postgresql.outputs.majors) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Fetch Trove's backup directory and kolla's upper-constraints
+        env:
+          TROVE_URL: ${{ needs.resolve-trove-backup-postgresql.outputs.trove_url }}
+          TROVE_SHA256: ${{ needs.resolve-trove-backup-postgresql.outputs.trove_sha256 }}
+          REQUIREMENTS_URL: ${{ needs.resolve-trove-backup-postgresql.outputs.requirements_url }}
+          REQUIREMENTS_SHA256: ${{ needs.resolve-trove-backup-postgresql.outputs.requirements_sha256 }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/trove.tar.gz" "$TROVE_URL"
+          echo "$TROVE_SHA256  $RUNNER_TEMP/trove.tar.gz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/trove"
+          tar -xzf "$RUNNER_TEMP/trove.tar.gz" -C "$RUNNER_TEMP/trove" --strip-components 1
+          test -f "$RUNNER_TEMP/trove/backup/requirements.txt"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/requirements.tar.gz" "$REQUIREMENTS_URL"
+          echo "$REQUIREMENTS_SHA256  $RUNNER_TEMP/requirements.tar.gz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/requirements" "$RUNNER_TEMP/constraints"
+          tar -xzf "$RUNNER_TEMP/requirements.tar.gz" -C "$RUNNER_TEMP/requirements" --strip-components 1
+          cp "$RUNNER_TEMP/requirements/upper-constraints.txt" "$RUNNER_TEMP/constraints/"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: linux/ppc64le
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the PostgreSQL ${{ matrix.major }} backup image
+        env:
+          MAJOR: ${{ matrix.major }}
+          IMAGE: ghcr.io/${{ github.repository }}/trove-backup-postgresql
+          SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          docker buildx build --platform linux/amd64,linux/ppc64le \
+            --build-arg PG_MAJOR="$MAJOR" \
+            --build-context constraints="$RUNNER_TEMP/constraints" \
+            --label "org.opencontainers.image.source=$SOURCE" \
+            --file images/trove-backup-postgresql/Dockerfile \
+            --tag "$IMAGE:$MAJOR" \
+            --push "$RUNNER_TEMP/trove/backup"
+
+  resolve-trove-guest:
+    if: inputs.track == 'trove-guest'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      trove_url: ${{ steps.trove.outputs.url }}
+      trove_sha256: ${{ steps.trove.outputs.sha256 }}
+      requirements_url: ${{ steps.requirements.outputs.url }}
+      requirements_sha256: ${{ steps.requirements.outputs.sha256 }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Resolve Trove as kolla installs it
+        id: trove
+        uses: ./.github/actions/kolla-source
+        with:
+          kolla: 77997/kolla
+          kolla-branch: stable/2026.1
+          source: trove-base
+
+      - name: Resolve the requirements kolla installs with
+        id: requirements
+        uses: ./.github/actions/kolla-source
+        with:
+          kolla: 77997/kolla
+          kolla-branch: stable/2026.1
+          source: openstack-base
+
+  build-trove-guest:
+    needs: resolve-trove-guest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, ppc64le]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up QEMU
+        if: matrix.arch == 'ppc64le'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: linux/ppc64le
+
+      - name: Install the disk tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-utils cloud-guest-utils
+
+      - name: Build the ${{ matrix.arch }} disk
+        env:
+          ARCH: ${{ matrix.arch }}
+          TROVE_URL: ${{ needs.resolve-trove-guest.outputs.trove_url }}
+          TROVE_SHA256: ${{ needs.resolve-trove-guest.outputs.trove_sha256 }}
+          REQUIREMENTS_URL: ${{ needs.resolve-trove-guest.outputs.requirements_url }}
+          REQUIREMENTS_SHA256: ${{ needs.resolve-trove-guest.outputs.requirements_sha256 }}
+          OUT: ${{ github.workspace }}/disk
+        run: |
+          sudo --preserve-env=ARCH,TROVE_URL,TROVE_SHA256,REQUIREMENTS_URL,REQUIREMENTS_SHA256,OUT \
+            images/trove-guest/build.sh
+
+      - name: Upload the disk
+        uses: actions/upload-artifact@v6
+        with:
+          name: trove-guest-${{ matrix.arch }}
+          path: disk/
+          compression-level: 0
+          retention-days: 5
+
+  release-trove-guest:
+    needs: [resolve-trove-guest, build-trove-guest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the disks
+        uses: actions/download-artifact@v7
+        with:
+          path: disks
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TROVE_URL: ${{ needs.resolve-trove-guest.outputs.trove_url }}
+          TROVE_SHA256: ${{ needs.resolve-trove-guest.outputs.trove_sha256 }}
+          REQUIREMENTS_URL: ${{ needs.resolve-trove-guest.outputs.requirements_url }}
+          REQUIREMENTS_SHA256: ${{ needs.resolve-trove-guest.outputs.requirements_sha256 }}
+        run: |
+          set -euo pipefail
+          TAG="trove-guest/$(TZ=America/St_Johns date +%Y%m%d)-${GITHUB_RUN_NUMBER}"
+          BODY="Trove from $TROVE_URL (sha256 $TROVE_SHA256), installed with the upper-constraints of $REQUIREMENTS_URL (sha256 $REQUIREMENTS_SHA256)."
+          for versions in disks/*.versions; do
+            BODY+=$'\n\n'"$(basename "$versions" .versions): $(paste -sd, "$versions" | sed 's/,/, /g')"
+          done
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --latest=false \
+            --title "Trove guest disks $(TZ=America/St_Johns date '+%b %-d, %Y (%Z)')" \
+            --notes "$BODY" \
+            disks/*.qcow2 disks/*.qcow2.sha256

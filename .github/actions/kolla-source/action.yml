@@ -1,0 +1,71 @@
+name: Kolla source
+description: The tarball a kolla image installs for one of its sources, as the kolla fork's branch names it, with its digest
+inputs:
+  kolla:
+    description: Kolla repository, as 77997/kolla
+    required: true
+  kolla-branch:
+    description: Kolla branch, as stable/2026.1
+    required: true
+  source:
+    description: Key of kolla's SOURCES, as trove-base
+    required: true
+outputs:
+  url:
+    description: The tarball's URL
+    value: ${{ steps.resolve.outputs.url }}
+  sha256:
+    description: The tarball's SHA-256 when it was resolved
+    value: ${{ steps.resolve.outputs.sha256 }}
+  openstack-release:
+    description: The OpenStack release the kolla branch builds, as 2026.1
+    value: ${{ steps.resolve.outputs.release }}
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        KOLLA: ${{ inputs.kolla }}
+        KOLLA_BRANCH: ${{ inputs.kolla-branch }}
+        SOURCE: ${{ inputs.source }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import ast
+        import hashlib
+        import os
+        import string
+        import sys
+        import urllib.request
+
+        KOLLA = f"https://raw.githubusercontent.com/{os.environ['KOLLA']}/refs/heads/{os.environ['KOLLA_BRANCH']}/"
+
+
+        def fetch(url):
+            with urllib.request.urlopen(url, timeout=120) as response:
+                return response.read()
+
+
+        def literal(source, name):
+            for node in ast.parse(source).body:
+                if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+                    return ast.literal_eval(node.value)
+            sys.exit(f"kolla assigns no {name}")
+
+
+        sources = literal(fetch(KOLLA + "kolla/common/sources.py"), "SOURCES")
+        config = fetch(KOLLA + "kolla/common/config.py")
+        release = literal(config, "OPENSTACK_RELEASE")
+        entry = sources.get(os.environ["SOURCE"])
+        if entry is None or entry.get("type") != "url":
+            sys.exit(f"kolla's {os.environ['SOURCE']} is not a url source: {entry}")
+        url = string.Template(entry["location"]).substitute(
+            tarballs_base=literal(config, "TARBALLS_BASE"),
+            openstack_branch=release if release == "master" else f"stable-{release}",
+        )
+        digest = hashlib.sha256(fetch(url)).hexdigest()
+        print(f"Resolved {os.environ['SOURCE']} {url} sha256 {digest} (OpenStack {release})")
+        with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+            out.write(f"url={url}\nsha256={digest}\nrelease={release}\n")
+        PY
