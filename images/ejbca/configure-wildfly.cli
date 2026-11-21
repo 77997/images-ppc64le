@@ -81,12 +81,12 @@ batch
 /subsystem=webservices:write-attribute(name=wsdl-host, value=jbossws.undefined.host)
 /subsystem=webservices:write-attribute(name=modify-wsdl-address, value=true)
 
-# WildFly's welcome page goes, and a GET outside EJBCA's own paths is sent to EJBCA's public pages, with Keyfactor's
-# predicate.
+# WildFly's welcome page goes, and a GET outside EJBCA's own paths is sent to EJBCA's RA pages, with Keyfactor's
+# predicate. EJBCA 9.6 serves nothing at /ejbca/ itself, so a GET of /ejbca or /ejbca/ is sent there too.
 /subsystem=undertow/server=default-server/host=default-host/location="\/":remove()
 /subsystem=undertow/configuration=handler/file=welcome-content:remove()
-/subsystem=undertow/configuration=filter/rewrite=redirect-to-app:add(redirect=true, target="/ejbca/")
-/subsystem=undertow/server=default-server/host=default-host/filter-ref=redirect-to-app:add(priority=1, predicate="method(GET) and not path-prefix(/ejbca,/crls,/certificates,/.well-known) and not equals({\%{LOCAL_PORT}, 4447})")
+/subsystem=undertow/configuration=filter/rewrite=redirect-to-app:add(redirect=true, target="/ejbca/ra/")
+/subsystem=undertow/server=default-server/host=default-host/filter-ref=redirect-to-app:add(priority=1, predicate="method(GET) and (path(/ejbca) or path(/ejbca/) or not path-prefix(/ejbca,/crls,/certificates,/.well-known)) and not equals({\%{LOCAL_PORT}, 4447})")
 
 # The ear in the image is the only deployment and never changes while the server runs, so the directory is scanned
 # once at start. The first start against a database from an earlier EJBCA upgrades its schema inside the deployment,
