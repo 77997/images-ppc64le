@@ -16,11 +16,12 @@ on:
           - trove-guest
           - zuul
           - gerrit
+          - ejbca
           - zookeeper
           - openstackclient
         default: pages
       version:
-        description: 'Image version, as 1.40.2, or a PostgreSQL major for trove-backup-postgresql (empty = highest release, or the newest major; gerrit and zuul build the release their release.env names)'
+        description: 'Image version, as 1.40.2, or a PostgreSQL major for trove-backup-postgresql (empty = highest release, or the newest major; gerrit, zuul and ejbca build the release their release.env names)'
         default: ''
       opflex_release:
         description: 'OpFlex release tag (empty = latest)'
@@ -2948,6 +2949,83 @@ jobs:
             --label "org.opencontainers.image.source=$SOURCE" \
             --tag "$IMAGE" \
             --push images/gerrit
+
+  build-ejbca:
+    if: inputs.track == 'ejbca'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Read the EJBCA release, its pinned downloads and the image revision
+        id: resolve
+        env:
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          . images/ejbca/release.env
+          # The configuration and the WildFly recipe are written for one EJBCA release, so the track builds that
+          # release and no other.
+          if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "$EJBCA_VERSION" ]; then
+            echo "release.env pins EJBCA $EJBCA_VERSION, not $REQUESTED"; exit 1
+          fi
+          for name in EJBCA_VERSION REVISION EJBCA_SOURCE_URL EJBCA_SOURCE_SHA256 WILDFLY_VERSION WILDFLY_URL \
+                      WILDFLY_SHA256 POSTGRESQL_JDBC_VERSION POSTGRESQL_JDBC_URL POSTGRESQL_JDBC_SHA256; do
+            [ -n "${!name:-}" ] || { echo "images/ejbca/release.env does not set $name"; exit 1; }
+          done
+          echo "Building EJBCA $EJBCA_VERSION on WildFly $WILDFLY_VERSION, image revision $REVISION"
+          {
+            echo "version=$EJBCA_VERSION"
+            echo "revision=$REVISION"
+            echo "ejbca_source_url=$EJBCA_SOURCE_URL"
+            echo "ejbca_source_sha256=$EJBCA_SOURCE_SHA256"
+            echo "wildfly_version=$WILDFLY_VERSION"
+            echo "wildfly_url=$WILDFLY_URL"
+            echo "wildfly_sha256=$WILDFLY_SHA256"
+            echo "postgresql_jdbc_url=$POSTGRESQL_JDBC_URL"
+            echo "postgresql_jdbc_sha256=$POSTGRESQL_JDBC_SHA256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: linux/ppc64le
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push EJBCA
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          EJBCA_SOURCE_URL: ${{ steps.resolve.outputs.ejbca_source_url }}
+          EJBCA_SOURCE_SHA256: ${{ steps.resolve.outputs.ejbca_source_sha256 }}
+          WILDFLY_VERSION: ${{ steps.resolve.outputs.wildfly_version }}
+          WILDFLY_URL: ${{ steps.resolve.outputs.wildfly_url }}
+          WILDFLY_SHA256: ${{ steps.resolve.outputs.wildfly_sha256 }}
+          POSTGRESQL_JDBC_URL: ${{ steps.resolve.outputs.postgresql_jdbc_url }}
+          POSTGRESQL_JDBC_SHA256: ${{ steps.resolve.outputs.postgresql_jdbc_sha256 }}
+          IMAGE: ghcr.io/${{ github.repository }}/ejbca:${{ steps.resolve.outputs.version }}-${{ steps.resolve.outputs.revision }}
+          SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          docker buildx build --platform linux/amd64,linux/ppc64le \
+            --build-arg EJBCA_VERSION="$VERSION" \
+            --build-arg EJBCA_SOURCE_URL="$EJBCA_SOURCE_URL" --build-arg EJBCA_SOURCE_SHA256="$EJBCA_SOURCE_SHA256" \
+            --build-arg WILDFLY_VERSION="$WILDFLY_VERSION" \
+            --build-arg WILDFLY_URL="$WILDFLY_URL" --build-arg WILDFLY_SHA256="$WILDFLY_SHA256" \
+            --build-arg POSTGRESQL_JDBC_URL="$POSTGRESQL_JDBC_URL" --build-arg POSTGRESQL_JDBC_SHA256="$POSTGRESQL_JDBC_SHA256" \
+            --label "org.opencontainers.image.source=$SOURCE" \
+            --tag "$IMAGE" \
+            --push images/ejbca
 
   build-zookeeper:
     if: inputs.track == 'zookeeper'

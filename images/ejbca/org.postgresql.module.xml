@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The PostgreSQL JDBC driver as a module, as the EJBCA this image replaces held it, so the datasource names it by
+     module and the deployments directory holds the ear alone. -->
+<module xmlns="urn:jboss:module:1.9" name="org.postgresql">
+    <resources>
+        <resource-root path="postgresql-jdbc.jar"/>
+    </resources>
+    <dependencies>
+        <!-- The driver is an automatic module that declares no requirement of its own; javax.api gives it the JDK's
+             APIs (java.sql among them), as the module of the EJBCA this image replaces does. -->
+        <module name="javax.api"/>
+        <module name="jakarta.transaction.api"/>
+    </dependencies>
+</module>
