@@ -1,0 +1,15 @@
+apr-util (1.6.6-1~as30265.1) trixie; urgency=medium
+
+  * Rebuild of Debian's 1.6.6-1 from sid, unchanged, for trixie in the
+    77997/images-ppc64le apt repository, for its IPv6 apr_memcache: trixie's
+    1.6.3-3+deb13u1 resolves and connects to a memcached server with
+    APR_INET only, so it cannot reach one that has only an IPv6 address.
+    The fix came with upstream 1.6.4:
+    - apache/apr-util 9d72f3a00e0b2c36fa98c7af6778f07593da6539 (r1907245):
+      conn_connect resolves the server's name in either address family.
+    - apache/apr-util b5930d63d2e2c14b8fdce243d6306142dc5260f6 (r1910631):
+      conn_connect cycles through the resolved addresses and creates each
+      socket in the family of its address.
+
+ -- Bear <61359476+bearnl@users.noreply.github.com>  Sat, 21 Nov 2026 01:10:00 -0330
+

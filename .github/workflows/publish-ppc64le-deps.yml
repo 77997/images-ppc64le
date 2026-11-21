@@ -1971,6 +1971,150 @@ jobs:
           path: opal-prd-deb/*.deb
           retention-days: 5
 
+  build-apr-util:
+    needs: resolve
+    if: inputs.track == 'pages'
+    runs-on: ubuntu-latest
+    env:
+      # trixie's apr-util 1.6.3-3+deb13u1 resolves and connects to a memcached server with APR_INET only, so
+      # mod_auth_openidc in kolla's httpd image cannot reach an IPv6-only memcached. Upstream fixed it in 1.6.4, and
+      # Debian's 1.6.6-1 in forky and sid carries the fix, so the build rebuilds that source unchanged for trixie, with
+      # only a changelog entry added. The version sorts above trixie's 1.6.3-3+deb13u1 and below Debian's 1.6.6-1, so
+      # a Debian 14 base takes Debian's package.
+      SOURCE_VERSION: 1.6.6-1
+      DSC_SHA256: dbbcf25bc4a32d66874cd0925b8ae1d0cf18e830930c66404c6c398bbfa2f26b
+      VERSION: 1.6.6-1~as30265.1
+      TRIXIE_VERSION: 1.6.3-3+deb13u1
+    steps:
+      - name: Checkout repository (for the changelog entry)
+        uses: actions/checkout@v5
+
+      - name: Cache apr-util debs
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: apr-util-debs
+          key: ${{ github.job }}-${{ env.VERSION }}-${{ fromJSON(needs.resolve.outputs.recipes)[github.job] }}-${{ hashFiles('deps/apr-util/*') }}
+
+      - name: Set up QEMU
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: linux/ppc64le
+
+      - name: Build apr-util for ppc64el from Debian's 1.6.6-1 unchanged
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p apr-util-debs
+          # APR resolves either family with AI_ADDRCONFIG, which offers ::1 only to a host holding an IPv6 address other
+          # than loopback or link-local, so the container gets one from a ULA network of its own.
+          docker network create --ipv6 --subnet fd65:a5c3:2026::/64 apr-util-build
+          docker run --rm --platform linux/ppc64le \
+            --network apr-util-build \
+            -v "${{ github.workspace }}/apr-util-debs:/output" \
+            -v "${{ github.workspace }}/deps/apr-util:/deps:ro" \
+            -e SOURCE_VERSION -e DSC_SHA256 -e VERSION -e TRIXIE_VERSION \
+            debian:trixie \
+            bash -c '
+              set -euxo pipefail
+              apt-get update
+              apt-get install -y --no-install-recommends build-essential ca-certificates curl dpkg-dev memcached
+
+              # The pinned checksum fixes the .dsc, and dpkg-source checks the tarballs and the signature against it.
+              mkdir /build && cd /build
+              POOL=https://deb.debian.org/debian/pool/main/a/apr-util
+              for F in "apr-util_${SOURCE_VERSION}.dsc" "apr-util_${SOURCE_VERSION%-*}.orig.tar.bz2" \
+                       "apr-util_${SOURCE_VERSION%-*}.orig.tar.bz2.asc" "apr-util_${SOURCE_VERSION}.debian.tar.xz"; do
+                curl -fsSLO --max-time 300 "$POOL/$F"
+              done
+              echo "$DSC_SHA256  apr-util_${SOURCE_VERSION}.dsc" | sha256sum -c -
+              dpkg-source --require-strong-checksums -x "apr-util_${SOURCE_VERSION}.dsc" apr-util
+              cd apr-util
+
+              # The IPv6 fix: conn_connect resolves the server in either family and creates each socket in the
+              # family of its address, and nothing in apr_memcache.c names APR_INET any more.
+              grep -qF "apr_int32_t family = APR_UNSPEC;" memcache/apr_memcache.c \
+                || { echo "::error title=apr-util::apr_memcache.c does not resolve with APR_UNSPEC"; exit 1; }
+              grep -qF "apr_socket_create(&conn->sock, sa->family, SOCK_STREAM" memcache/apr_memcache.c \
+                || { echo "::error title=apr-util::apr_memcache.c does not create the socket in the family of its address"; exit 1; }
+              if grep -qw APR_INET memcache/apr_memcache.c; then
+                echo "::error title=apr-util::apr_memcache.c still names APR_INET"; exit 1
+              fi
+
+              cat /deps/changelog debian/changelog > /tmp/changelog
+              mv /tmp/changelog debian/changelog
+              test "$(dpkg-parsechangelog -S Version)" = "$VERSION" \
+                || { echo "::error title=apr-util::The changelog entry names $(dpkg-parsechangelog -S Version), not $VERSION"; exit 1; }
+              for BOUND in "gt ${TRIXIE_VERSION}" "lt ${SOURCE_VERSION}"; do
+                dpkg --compare-versions "$VERSION" $BOUND \
+                  || { echo "::error title=apr-util::$VERSION is not $BOUND"; exit 1; }
+              done
+
+              # The test suite runs, so the rebuild is checked against trixie'\''s libraries. Its apr_memcache tests
+              # run only once its own probe (check_mc) has reached memcached on localhost, and that probe resolves
+              # and connects with APR_INET alone, so a memcached listens on 127.0.0.1 for the probe, and another on
+              # ::1. The library resolves localhost with APR_UNSPEC, and glibc orders ::1 (precedence 50) before
+              # 127.0.0.1 (35), so its tests store into the instance on ::1; a library without the IPv6 fix resolves
+              # with APR_INET and would store into the instance on 127.0.0.1. The probe only asks for the version,
+              # so the instance on 127.0.0.1 records no set.
+              grep -qE "^::1[[:space:]](.*[[:space:]])?localhost([[:space:]]|$)" /etc/hosts \
+                || { echo "::error title=apr-util::/etc/hosts does not resolve localhost to ::1"; exit 1; }
+              grep -qE "^127\.0\.0\.1[[:space:]](.*[[:space:]])?localhost([[:space:]]|$)" /etc/hosts \
+                || { echo "::error title=apr-util::/etc/hosts does not resolve localhost to 127.0.0.1"; exit 1; }
+              memcached -u nobody -l 127.0.0.1 -p 11211 -U 0 &
+              memcached -u nobody -l ::1 -p 11211 -U 0 &
+              for ADDR in 127.0.0.1 ::1; do
+                for I in $(seq 1 60); do
+                  if (exec 3<>"/dev/tcp/$ADDR/11211") 2>/dev/null; then break; fi
+                  test "$I" -lt 60 || { echo "::error title=apr-util::memcached does not listen on $ADDR port 11211"; exit 1; }
+                  sleep 1
+                done
+              done
+
+              apt-get build-dep -y --no-install-recommends .
+              dpkg-buildpackage -us -uc -b 2>&1 | tee /tmp/build.log
+              if grep -qF "Skipping apr_memcache tests" /tmp/build.log; then
+                echo "::error title=apr-util::The apr_memcache tests did not reach memcached on 127.0.0.1:11211"; exit 1
+              fi
+              sets() {
+                exec 3<>"/dev/tcp/$1/11211"
+                printf "stats\r\nquit\r\n" >&3
+                sed -n "s/^STAT cmd_set \([0-9]*\).*/\1/p" <&3
+                exec 3<&-
+              }
+              SETS6="$(sets ::1)"
+              SETS4="$(sets 127.0.0.1)"
+              test -n "$SETS6" && test "$SETS6" -gt 0 \
+                || { echo "::error title=apr-util::The apr_memcache tests stored nothing in memcached on [::1]:11211"; exit 1; }
+              test "$SETS4" = 0 \
+                || { echo "::error title=apr-util::The apr_memcache tests stored into memcached on 127.0.0.1:11211, not [::1]:11211"; exit 1; }
+              cd /build
+
+              # Every binary package of the source is published at one version, since each depends on
+              # libaprutil1t64 (= its version) and apache2-bin needs libaprutil1-ldap and a DBD driver beside it.
+              # The listing goes to a file first: grep -q stops reading at its first match, and under pipefail the
+              # tar that dpkg-deb runs would die of SIGPIPE and fail the check that just matched.
+              dpkg-deb -c "libaprutil1t64_${VERSION}_ppc64el.deb" > /tmp/libaprutil1t64.list
+              grep -qE " \./usr/lib/powerpc64le-linux-gnu/libaprutil-1\.so\.0\.[0-9.]+$" /tmp/libaprutil1t64.list \
+                || { echo "::error title=apr-util::libaprutil1t64_${VERSION}_ppc64el.deb holds no libaprutil-1.so.0"; exit 1; }
+              for PKG in libaprutil1t64 libaprutil1-ldap libaprutil1-dbd-mysql libaprutil1-dbd-sqlite3 \
+                         libaprutil1-dbd-odbc libaprutil1-dbd-pgsql libaprutil1-dev; do
+                DEB="${PKG}_${VERSION}_ppc64el.deb"
+                test -f "$DEB" || { echo "::error title=apr-util::$DEB was not built"; exit 1; }
+                cp "$DEB" /output/
+              done
+            '
+          docker network rm apr-util-build
+          ls -la apr-util-debs/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: apr-util-debs
+          path: apr-util-debs/*.deb
+          retention-days: 5
+
   publish:
     needs:
       - resolve
@@ -2001,6 +2145,7 @@ jobs:
       - build-grafana-plugins
       - build-rsct
       - build-opal-prd
+      - build-apr-util
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -2037,6 +2182,7 @@ jobs:
           cp artifacts/grafana-deb/*.deb $SITE/apt/
           cp artifacts/rsct-debs/*.deb $SITE/apt/
           cp artifacts/opal-prd-deb/*.deb $SITE/apt/
+          cp artifacts/apr-util-debs/*.deb $SITE/apt/
           cd $SITE/apt
           dpkg-scanpackages . /dev/null > Packages
           gzip -k Packages
