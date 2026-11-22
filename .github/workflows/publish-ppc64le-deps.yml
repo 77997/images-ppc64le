@@ -17,11 +17,12 @@ on:
           - zuul
           - gerrit
           - ejbca
+          - keycloak
           - zookeeper
           - openstackclient
         default: pages
       version:
-        description: 'Image version, as 1.40.2, or a PostgreSQL major for trove-backup-postgresql (empty = highest release, or the newest major; gerrit, zuul and ejbca build the release their release.env names)'
+        description: 'Image version, as 1.40.2, or a PostgreSQL major for trove-backup-postgresql (empty = highest release, or the newest major; gerrit, zuul, ejbca and keycloak build the release their release.env names)'
         default: ''
       opflex_release:
         description: 'OpFlex release tag (empty = latest)'
@@ -3026,6 +3027,69 @@ jobs:
             --label "org.opencontainers.image.source=$SOURCE" \
             --tag "$IMAGE" \
             --push images/ejbca
+
+  build-keycloak:
+    if: inputs.track == 'keycloak'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Read the Keycloak release, its pinned download and the image revision
+        id: resolve
+        env:
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          . images/keycloak/release.env
+          # The build-time options are chosen for one Keycloak release, so the track builds that release and no
+          # other.
+          if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "$KEYCLOAK_VERSION" ]; then
+            echo "release.env pins Keycloak $KEYCLOAK_VERSION, not $REQUESTED"; exit 1
+          fi
+          for name in KEYCLOAK_VERSION REVISION KEYCLOAK_URL KEYCLOAK_SHA256; do
+            [ -n "${!name:-}" ] || { echo "images/keycloak/release.env does not set $name"; exit 1; }
+          done
+          echo "Building Keycloak $KEYCLOAK_VERSION, image revision $REVISION"
+          {
+            echo "version=$KEYCLOAK_VERSION"
+            echo "revision=$REVISION"
+            echo "keycloak_url=$KEYCLOAK_URL"
+            echo "keycloak_sha256=$KEYCLOAK_SHA256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: linux/ppc64le
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Keycloak
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          KEYCLOAK_URL: ${{ steps.resolve.outputs.keycloak_url }}
+          KEYCLOAK_SHA256: ${{ steps.resolve.outputs.keycloak_sha256 }}
+          IMAGE: ghcr.io/${{ github.repository }}/keycloak:${{ steps.resolve.outputs.version }}-${{ steps.resolve.outputs.revision }}
+          SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          docker buildx build --platform linux/amd64,linux/ppc64le \
+            --build-arg KEYCLOAK_VERSION="$VERSION" \
+            --build-arg KEYCLOAK_URL="$KEYCLOAK_URL" --build-arg KEYCLOAK_SHA256="$KEYCLOAK_SHA256" \
+            --label "org.opencontainers.image.source=$SOURCE" \
+            --tag "$IMAGE" \
+            --push images/keycloak
 
   build-zookeeper:
     if: inputs.track == 'zookeeper'
