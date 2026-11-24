@@ -2909,19 +2909,19 @@ jobs:
         run: |
           set -euo pipefail
           . images/gerrit/release.env
-          # The OAuth plugin is pinned for one Gerrit release, so the track builds that release and no other.
+          # The SAML plugin is pinned for one Gerrit release, so the track builds that release and no other.
           if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "$GERRIT_VERSION" ]; then
             echo "release.env pins Gerrit $GERRIT_VERSION, not $REQUESTED"; exit 1
           fi
           MD5="$(curl -fsSI "https://gerrit-releases.storage.googleapis.com/gerrit-$GERRIT_VERSION.war" \
             | sed -nE 's/^x-goog-hash: md5=([A-Za-z0-9+/=]+).*/\1/Ip' | base64 -d | od -An -tx1 | tr -d ' \n')"
           [ ${#MD5} -eq 32 ] || { echo "No MD5 published for gerrit-$GERRIT_VERSION.war"; exit 1; }
-          echo "Building Gerrit $GERRIT_VERSION, image revision $REVISION"
+          echo "Building Gerrit $GERRIT_VERSION with the SAML plugin at $SAML_COMMIT, image revision $REVISION"
           { echo "version=$GERRIT_VERSION"; echo "revision=$REVISION"; echo "md5=$MD5"; } >> "$GITHUB_OUTPUT"
 
-      - name: Build the OAuth plugin's Entra ID provider
+      - name: Build the SAML plugin
         timeout-minutes: 60
-        run: images/gerrit/build-oauth-plugin.sh images/gerrit/oauth.jar
+        run: images/gerrit/build-saml-plugin.sh images/gerrit/saml.jar
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
