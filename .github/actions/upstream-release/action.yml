@@ -6,6 +6,9 @@ inputs:
     required: true
   version:
     description: Version to build, as 1.40.2 (empty = highest release)
+  v-prefix:
+    description: Whether the repository's release tags start with v, as v1.40.2 (true), or not, as 2026.11.2 (false)
+    default: 'true'
 outputs:
   version:
     description: The version to build
@@ -19,13 +22,20 @@ runs:
         GH_TOKEN: ${{ github.token }}
         REPOSITORY: ${{ inputs.repository }}
         VERSION: ${{ inputs.version }}
+        V_PREFIX: ${{ inputs.v-prefix }}
       run: |
         set -euo pipefail
+        case "$V_PREFIX" in
+          true) PREFIX=v ;;
+          false) PREFIX= ;;
+          *) echo "v-prefix must be true or false, not $V_PREFIX"; exit 1 ;;
+        esac
         if [ -z "$VERSION" ]; then
           VERSION="$(gh api --paginate "repos/$REPOSITORY/releases" \
-            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            | { grep -E "^${PREFIX}[0-9]+\.[0-9]+\.[0-9]+$" || true; } \
             | sort -V | tail -1)"
-          VERSION="${VERSION#v}"
+          VERSION="${VERSION#"$PREFIX"}"
         fi
         [ -n "$VERSION" ] || { echo "$REPOSITORY version resolution failed"; exit 1; }
         echo "Resolved $REPOSITORY $VERSION"

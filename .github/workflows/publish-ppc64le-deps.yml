@@ -47,6 +47,7 @@ jobs:
       drm: ${{ steps.rsct.outputs.drm }}
       opflex: ${{ steps.opflex.outputs.tag }}
       smartctl_exporter: ${{ steps.smartctl.outputs.version }}
+      cloudflared: ${{ steps.cloudflared.outputs.version }}
       wheels: ${{ steps.kolla.outputs.wheels }}
       debs: ${{ steps.kolla.outputs.debs }}
       tarballs: ${{ steps.kolla.outputs.tarballs }}
@@ -111,6 +112,13 @@ jobs:
         with:
           repository: prometheus-community/smartctl_exporter
 
+      - name: Resolve the cloudflared release
+        id: cloudflared
+        uses: ./.github/actions/upstream-release
+        with:
+          repository: cloudflare/cloudflared
+          v-prefix: 'false'
+
       - name: Resolve the wheels, debs, tarballs and Grafana plugins
         id: kolla
         env:
@@ -119,6 +127,7 @@ jobs:
           DRM: ${{ steps.rsct.outputs.drm }}
           OPFLEX: ${{ steps.opflex.outputs.tag }}
           SMARTCTL_EXPORTER: ${{ steps.smartctl.outputs.version }}
+          CLOUDFLARED: ${{ steps.cloudflared.outputs.version }}
           WHEELS: >-
             grpcio cryptography bcrypt pynacl uwsgi python-qpid-proton py-radix numpy pyzmq magnum-cluster-api
             pyyaml markupsafe msgpack wrapt psutil pyrsistent netifaces tornado sysv-ipc ujson pillow psycopg2
@@ -284,6 +293,7 @@ jobs:
               *((plugin["name"], plugin["version"]) for plugin in grafana_plugins),
               *((name, tarball["tag"]) for name, tarball in tarballs.items()),
               ("smartctl-exporter", "v" + os.environ["SMARTCTL_EXPORTER"]),
+              ("cloudflared", os.environ["CLOUDFLARED"]),
               *wheels.items(),
               ("rsct", os.environ["RSCT"]),
               ("dynamicrm", os.environ["DRM"]),
@@ -2117,6 +2127,107 @@ jobs:
           path: apr-util-debs/*.deb
           retention-days: 5
 
+  build-cloudflared:
+    needs: resolve
+    if: inputs.track == 'pages'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.resolve.outputs.cloudflared }}
+    steps:
+      - name: Cache cloudflared deb
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: cloudflared-deb
+          key: ${{ github.job }}-${{ env.VERSION }}-${{ fromJSON(needs.resolve.outputs.recipes)[github.job] }}
+
+      - name: Set up QEMU
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: linux/ppc64le
+
+      - name: Cross-compile the cloudflared release unchanged for ppc64le with its own Makefile and the Go its go.mod names, and package it, since Cloudflare publishes no ppc64el build
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p cloudflared-deb
+          docker run --rm \
+            -v "${{ github.workspace }}/cloudflared-deb:/output" \
+            -e VERSION \
+            -e GOTOOLCHAIN=auto \
+            golang:trixie \
+            bash -c '
+              set -euxo pipefail
+              git clone --depth 1 --branch "$VERSION" https://github.com/cloudflare/cloudflared.git /src
+              cd /src
+              test "$(git describe --tags --exact-match)" = "$VERSION" \
+                || { echo "::error title=cloudflared $VERSION::The clone is not at the release tag"; exit 1; }
+              GO="go$(go list -m -f "{{.GoVersion}}")"
+              env GOOS=linux GOARCH=ppc64le GOPPC64=power8 CGO_ENABLED=0 make install DESTDIR=/pkg
+
+              BIN=/pkg/usr/bin/cloudflared
+              go version -m "$BIN" | tee /tmp/buildinfo
+              test "$(head -1 /tmp/buildinfo)" = "$BIN: $GO" \
+                || { echo "::error title=cloudflared $VERSION::It is not built with $GO, the Go its go.mod names"; exit 1; }
+              for S in GOOS=linux GOARCH=ppc64le GOPPC64=power8 CGO_ENABLED=0 vcs.modified=false "vcs.revision=$(git rev-parse HEAD)"; do
+                grep -qxF "$(printf "\tbuild\t%s" "$S")" /tmp/buildinfo \
+                  || { echo "::error title=cloudflared $VERSION::It lacks build setting $S"; exit 1; }
+              done
+
+              gzip -9n /pkg/usr/share/man/man1/cloudflared.1
+              install -d /pkg/usr/share/doc/cloudflared /pkg/DEBIAN
+              install -m 644 LICENSE /pkg/usr/share/doc/cloudflared/copyright
+              DEB_VERSION="$VERSION~as30265.1"
+              printf "%s\n" \
+                "Package: cloudflared" \
+                "Version: $DEB_VERSION" \
+                "Architecture: ppc64el" \
+                "Maintainer: Bear <61359476+bearnl@users.noreply.github.com>" \
+                "Installed-Size: $(du -sk --exclude=DEBIAN /pkg | cut -f1)" \
+                "Section: net" \
+                "Priority: optional" \
+                "Homepage: https://github.com/cloudflare/cloudflared" \
+                "Description: Cloudflare Tunnel daemon" \
+                " The cloudflared release $VERSION, built unchanged for ppc64el from its" \
+                " release tag with the Makefile of its own source." \
+                > /pkg/DEBIAN/control
+              DEB="/output/cloudflared_${DEB_VERSION}_ppc64el.deb"
+              dpkg-deb --root-owner-group --build /pkg "$DEB"
+
+              dpkg-deb -c "$DEB" | awk "{print \$NF}" > /tmp/contents
+              for F in usr/bin/cloudflared usr/share/man/man1/cloudflared.1.gz usr/share/doc/cloudflared/copyright; do
+                grep -qxF "./$F" /tmp/contents \
+                  || { echo "::error title=cloudflared $VERSION::$DEB holds no $F"; exit 1; }
+              done
+              test "$(dpkg-deb -f "$DEB" Version)" = "$DEB_VERSION"
+              test "$(dpkg-deb -f "$DEB" Architecture)" = ppc64el
+            '
+          ls -la cloudflared-deb/
+
+      - name: Run the packaged binary on ppc64le under QEMU and check the version it reports
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          set -- cloudflared-deb/*.deb
+          [ "$#" -eq 1 ] || { echo "::error title=cloudflared $VERSION::cloudflared-deb holds $# packages"; exit 1; }
+          dpkg-deb -x "$1" cloudflared-check
+          OUT="$(docker run --rm --platform linux/ppc64le \
+            -v "${{ github.workspace }}/cloudflared-check:/check:ro" \
+            debian:trixie /check/usr/bin/cloudflared --version)"
+          echo "$OUT"
+          case "$OUT" in
+            "cloudflared version $VERSION (built "*) ;;
+            *) echo "::error title=cloudflared $VERSION::The ppc64le binary reports: $OUT"; exit 1 ;;
+          esac
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: cloudflared-deb
+          path: cloudflared-deb/*.deb
+          retention-days: 5
+
   publish:
     needs:
       - resolve
@@ -2148,6 +2259,7 @@ jobs:
       - build-rsct
       - build-opal-prd
       - build-apr-util
+      - build-cloudflared
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -2185,6 +2297,7 @@ jobs:
           cp artifacts/rsct-debs/*.deb $SITE/apt/
           cp artifacts/opal-prd-deb/*.deb $SITE/apt/
           cp artifacts/apr-util-debs/*.deb $SITE/apt/
+          cp artifacts/cloudflared-deb/*.deb $SITE/apt/
           cd $SITE/apt
           dpkg-scanpackages . /dev/null > Packages
           gzip -k Packages
