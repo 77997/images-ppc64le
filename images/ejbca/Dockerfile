@@ -54,8 +54,8 @@ RUN set -eu; \
     sed -i '/.*org.jboss.resteasy.resteasy-crypto.*/d' "$module"; \
     rm -r /opt/wildfly/modules/system/layers/base/org/jboss/resteasy/resteasy-crypto
 
-# EJBCA's source, with the configuration of the EJBCA this image replaces. The conf files are read by the build and
-# carried inside the ear and the CLI.
+# EJBCA's source, with the configuration of the EJBCA this image replaces and the ports its web listens on. The conf
+# files are read by the build and carried inside the ear and the CLI.
 RUN set -eu; \
     curl -fsSLo /tmp/ejbca.tar.gz "$EJBCA_SOURCE_URL"; \
     echo "$EJBCA_SOURCE_SHA256  /tmp/ejbca.tar.gz" | sha256sum -c -; \
@@ -64,7 +64,7 @@ RUN set -eu; \
     rm /tmp/ejbca.tar.gz; \
     grep -qx "app.version.number=$EJBCA_VERSION" /build/ejbca/src/internal.properties \
       || { echo "The source archive is not EJBCA $EJBCA_VERSION" >&2; exit 1; }
-COPY conf/cesecore.properties conf/database.properties conf/ejbca.properties /build/ejbca/conf/
+COPY conf/cesecore.properties conf/database.properties conf/ejbca.properties conf/web.properties /build/ejbca/conf/
 
 # build is Keyfactor's target for the ear (dist/ejbca.ear); ejbca-ejb-cli builds dist/ejbca-ejb-cli, which
 # bin/ejbca.sh runs. APPSRV_HOME tells the build which application server it targets.
@@ -154,5 +154,5 @@ ENV EJBCA_JAVA_OPTS="-Xms2g -Xmx2g -XX:+AlwaysPreTouch -XX:MaxMetaspaceSize=512m
 
 USER ejbca
 WORKDIR /opt/wildfly
-EXPOSE 8080 8442 8443
+EXPOSE 80 443
 ENTRYPOINT ["/entrypoint.sh"]
